@@ -1,0 +1,22 @@
+[package]
+name = "flaky"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alioth = "0.12"
+anyhow = "1"
+arcbox-ext4 = "0.1"
+backhand = "0.25"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+erofs-builder = "0.1"
+flate2 = "1"
+log = "0.4"
+oci-spec = "0.10"
+serde_json = "1"
+tar = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+zstd = "0.13"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
