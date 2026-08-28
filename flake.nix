@@ -47,7 +47,7 @@
                 (toString ./build.rs)
               ];
           };
-          guest-init = pkgs.rustPlatform.buildRustPackage {
+          guest-init = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
             pname = "guest-init";
             version = "0.1.0";
             inherit src;
