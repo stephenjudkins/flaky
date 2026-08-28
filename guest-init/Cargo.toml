@@ -3,7 +3,10 @@ name = "guest-init"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-
 [dependencies]
+futures = "0.3"
+hello-rpc = { path = "../hello-rpc" }
 libc = "0.2"
+serde = "1"
+tarpc = { version = "0.36", features = ["serde-transport", "serde-transport-json"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
