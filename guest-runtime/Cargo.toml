@@ -1,5 +1,5 @@
 [package]
-name = "guest-init"
+name = "guest-runtime"
 version.workspace = true
 edition.workspace = true
 
@@ -11,4 +11,4 @@ serde.workspace = true
 tarpc.workspace = true
 tokio.workspace = true
 tokio-vsock.workspace = true
-vm-controller-rpc.workspace = true
+apis.workspace = true

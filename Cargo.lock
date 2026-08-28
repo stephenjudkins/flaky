@@ -114,6 +114,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apis"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "postcard",
+ "serde",
+ "tarpc",
+ "tokio-serde",
+]
+
+[[package]]
 name = "arcbox-ext4"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -658,6 +669,7 @@ version = "0.1.0"
 dependencies = [
  "alioth",
  "anyhow",
+ "apis",
  "arcbox-ext4",
  "backhand",
  "clap",
@@ -673,7 +685,6 @@ dependencies = [
  "tar",
  "tarpc",
  "tokio",
- "vm-controller-rpc",
  "zstd",
 ]
 
@@ -822,9 +833,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "guest-init"
+name = "guest-runtime"
 version = "0.1.0"
 dependencies = [
+ "apis",
  "futures",
  "nix",
  "pid1",
@@ -832,7 +844,6 @@ dependencies = [
  "tarpc",
  "tokio",
  "tokio-vsock",
- "vm-controller-rpc",
 ]
 
 [[package]]
@@ -1974,17 +1985,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vm-controller-rpc"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "postcard",
- "serde",
- "tarpc",
- "tokio-serde",
-]
 
 [[package]]
 name = "vsock"

@@ -38,19 +38,19 @@
             src = ./.;
             filter =
               path: type:
-              nixpkgs.lib.hasPrefix "${toString ./guest-init}" path
-              || nixpkgs.lib.hasPrefix "${toString ./vm-controller-rpc}" path
+              nixpkgs.lib.hasPrefix "${toString ./guest-runtime}" path
+              || nixpkgs.lib.hasPrefix "${toString ./apis}" path
               || nixpkgs.lib.hasPrefix "${toString ./host}" path
               || builtins.elem path [
                 (toString ./Cargo.toml)
                 (toString ./Cargo.lock)
               ];
           };
-          guest-init = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
-            pname = "guest-init";
+          guest-runtime = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+            pname = "guest-runtime";
             version = "0.1.0";
             inherit src;
-            buildAndTestSubdir = "guest-init";
+            buildAndTestSubdir = "guest-runtime";
             cargoLock.lockFile = ./Cargo.lock;
           };
           initramfs = bp.runCommand "initramfs.cpio.gz"
@@ -59,7 +59,7 @@
                 bp.cpio
                 bp.gzip
               ];
-              closure = bp.closureInfo { rootPaths = [ guest-init ]; };
+              closure = bp.closureInfo { rootPaths = [ guest-runtime ]; };
             }
             ''
               root=$(mktemp -d)
@@ -67,12 +67,12 @@
               while read -r p; do
                 cp -R "$p" "$root/nix/store/"
               done < "$closure/store-paths"
-              ln -s ${guest-init}/bin/guest-init $root/init
+              ln -s ${guest-runtime}/bin/guest-runtime $root/init
               (cd "$root" && find . | LC_ALL=C sort | cpio -o -H newc --reproducible | gzip -9n) > $out
             '';
         in
         {
-          inherit guest-init initramfs;
+          inherit guest-runtime initramfs;
         }
       );
     };

@@ -1,6 +1,3 @@
-pub use tarpc;
-pub use tokio_serde;
-
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -9,7 +6,6 @@ use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_serde::{Deserializer, Serializer};
 
-#[derive(Debug)]
 pub struct Postcard<Item, SinkItem> {
     ghost: PhantomData<(Item, SinkItem)>,
 }
@@ -42,10 +38,4 @@ where
     fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
         postcard::from_bytes(src).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
-}
-
-#[tarpc::service]
-pub trait VmController {
-    async fn hello(x: String) -> String;
-    async fn shutdown() -> String;
 }

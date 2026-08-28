@@ -1,5 +1,5 @@
 [workspace]
-members = ["host", "guest-init", "vm-controller-rpc"]
+members = ["host", "guest-runtime", "apis"]
 resolver = "3"
 
 [workspace.package]
@@ -31,5 +31,5 @@ tarpc = { version = "0.36", features = ["serde-transport"] }
 tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
 tokio-serde = { version = "0.9", default-features = false }
 tokio-vsock = "0.7"
-vm-controller-rpc = { path = "vm-controller-rpc" }
+apis = { path = "apis" }
 zstd = "0.13"

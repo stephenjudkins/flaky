@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::prelude::*;
+use apis::VmController;
+use apis::tarpc::context;
+use apis::tarpc::server::{BaseChannel, Channel};
 use nix::fcntl::OFlag;
 use nix::mount::MsFlags;
 use tokio_vsock::VMADDR_CID_HOST;
 use tokio_vsock::VsockAddr;
 use tokio_vsock::VsockStream;
-use vm_controller_rpc::VmController;
-use vm_controller_rpc::tarpc::context;
-use vm_controller_rpc::tarpc::server::{BaseChannel, Channel};
 
 const VSOCK_PORT: u32 = 5000;
 
@@ -69,9 +69,9 @@ async fn serve() -> std::io::Result<()> {
     loop {
         let stream = VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, VSOCK_PORT)).await?;
         let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
-        let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
+        let transport = apis::tarpc::serde_transport::Transport::from((
             stream,
-            vm_controller_rpc::Postcard::default(),
+            apis::Postcard::default(),
         ));
         let channel = BaseChannel::with_defaults(transport);
         let server = VmControllerServer {
@@ -93,7 +93,7 @@ async fn serve() -> std::io::Result<()> {
 fn main() {
     setup_console();
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "guest-init: pid {}", std::process::id());
+    let _ = writeln!(out, "guest-runtime: pid {}", std::process::id());
     if let Err(e) = pid1::Pid1Settings::new().launch() {
         let _ = writeln!(out, "guest: pid1 launch failed: {e}");
         let _ = out.flush();
