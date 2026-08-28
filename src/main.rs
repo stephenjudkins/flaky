@@ -1,5 +1,4 @@
 use std::ffi::CString;
-use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 
 use vm_controller_rpc::VmControllerClient;
-use vm_controller_rpc::tarpc::client::{NewClient, RpcError};
+use vm_controller_rpc::tarpc::client::NewClient;
 use vm_controller_rpc::tarpc::context;
 use vm_controller_rpc::tarpc::serde_transport::Transport;
 use vm_controller_rpc::tarpc::tokio_serde::formats::Json;
@@ -22,46 +21,53 @@ mod vsock_device;
 use vsock_device::{VsockHost, VsockParam};
 
 const VSOCK_PORT: u32 = 5000;
+const RPC_ATTEMPTS: usize = 50;
 
-async fn call_rpc<F, Fut>(vsock_host: &VsockHost, mut f: F) -> anyhow::Result<String>
-where
-    F: FnMut(VmControllerClient) -> Fut,
-    Fut: Future<Output = Result<String, RpcError>>,
-{
-    let mut last_err = None;
-    for _ in 0..50 {
-        match try_call_rpc(vsock_host, &mut f).await {
-            Ok(resp) => return Ok(resp),
+async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
+    for attempt in 1..=RPC_ATTEMPTS {
+        let stream = match vsock_host.connect(VSOCK_PORT) {
+            Ok(stream) => tokio::net::UnixStream::from_std(stream)?,
             Err(e) => {
-                eprintln!("host: rpc attempt failed: {e:#}");
-                last_err = Some(e);
+                eprintln!("host: rpc attempt {attempt} failed: {e:#}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
             }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "rpc failed after retries: {}",
-        last_err.map(|e| e.to_string()).unwrap_or_default()
-    ))
-}
+        };
+        let transport = Transport::from((stream, Json::default()));
+        let NewClient { client, dispatch } = VmControllerClient::new(
+            vm_controller_rpc::tarpc::client::Config::default(),
+            transport,
+        );
+        tokio::pin!(dispatch);
 
-async fn try_call_rpc<F, Fut>(vsock_host: &VsockHost, f: &mut F) -> anyhow::Result<String>
-where
-    F: FnMut(VmControllerClient) -> Fut,
-    Fut: Future<Output = Result<String, RpcError>>,
-{
-    let stream = vsock_host.connect(VSOCK_PORT)?;
-    let stream = tokio::net::UnixStream::from_std(stream)?;
-    let transport = Transport::from((stream, Json::default()));
-    let NewClient { client, dispatch } = VmControllerClient::new(
-        vm_controller_rpc::tarpc::client::Config::default(),
-        transport,
-    );
-    let resp = tokio::select! {
-        resp = f(client) => resp.map_err(|e| anyhow::anyhow!("rpc call: {e}"))?,
-        _ = dispatch => anyhow::bail!("dispatch terminated"),
-    };
-    Ok(resp)
+        let resp = tokio::select! {
+            resp = client.hello(context::current(), "world".to_string()) => resp,
+            _ = &mut dispatch => {
+                eprintln!("host: rpc attempt {attempt} failed: dispatch terminated");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!("host: rpc attempt {attempt} failed: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        println!("host: guest replied: {resp}");
+
+        let resp = tokio::select! {
+            resp = client.shutdown(context::current()) => {
+                resp.map_err(|e| anyhow::anyhow!("rpc call: {e}"))?
+            }
+            _ = &mut dispatch => anyhow::bail!("dispatch terminated"),
+        };
+        println!("host: guest replied: {resp}");
+        return Ok(());
+    }
+    anyhow::bail!("rpc failed after {RPC_ATTEMPTS} attempts");
 }
 
 fn main() -> anyhow::Result<()> {
@@ -113,15 +119,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let resp = rt.block_on(call_rpc(&vsock_host, |c| async move {
-        c.hello(context::current(), "world".to_string()).await
-    }))?;
-    println!("host: guest replied: {resp}");
-
-    let resp = rt.block_on(call_rpc(&vsock_host, |c| async move {
-        c.shutdown(context::current()).await
-    }))?;
-    println!("host: guest replied: {resp}");
+    rt.block_on(run_session(&vsock_host))?;
 
     vm.wait()?;
     Ok(())
