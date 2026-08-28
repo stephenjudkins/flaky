@@ -1,9 +1,10 @@
-use std::ffi::CString;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::prelude::*;
+use nix::fcntl::OFlag;
+use nix::mount::MsFlags;
 use vm_controller_rpc::VmController;
 use vm_controller_rpc::tarpc::context;
 use vm_controller_rpc::tarpc::server::{BaseChannel, Channel};
@@ -13,35 +14,33 @@ mod vsock;
 const VSOCK_PORT: u32 = 5000;
 
 fn setup_console() {
-    unsafe {
-        let none = CString::new("none").unwrap();
-        let dev = CString::new("/dev").unwrap();
-        let devtmpfs = CString::new("devtmpfs").unwrap();
-        libc::mount(
-            none.as_ptr(),
-            dev.as_ptr(),
-            devtmpfs.as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-        let console = CString::new("/dev/console").unwrap();
-        let fd = libc::open(console.as_ptr(), libc::O_RDWR);
-        if fd >= 0 {
-            libc::dup2(fd, 0);
-            libc::dup2(fd, 1);
-            libc::dup2(fd, 2);
-            if fd > 2 {
-                libc::close(fd);
-            }
-        }
+    let _ = nix::mount::mount(
+        None::<&str>,
+        "/dev",
+        Some("devtmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    );
+    let _ = nix::mount::mount(
+        None::<&str>,
+        "/proc",
+        Some("proc"),
+        MsFlags::empty(),
+        None::<&str>,
+    );
+    if let Ok(fd) = nix::fcntl::open("/dev/console", OFlag::O_RDWR, nix::sys::stat::Mode::empty()) {
+        let _ = nix::unistd::dup2_stdin(&fd);
+        let _ = nix::unistd::dup2_stdout(&fd);
+        let _ = nix::unistd::dup2_stderr(&fd);
     }
 }
 
 fn poweroff() -> ! {
-    unsafe {
-        libc::sync();
-        libc::reboot(libc::RB_POWER_OFF as libc::c_int);
-    }
+    nix::unistd::sync();
+    let Err(e) = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "guest: poweroff failed: {e}");
+    let _ = out.flush();
     loop {
         std::thread::park();
     }
@@ -67,7 +66,7 @@ async fn serve() -> std::io::Result<()> {
     let mut out = std::io::stdout();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     loop {
-        let stream = vsock::VsockStream::connect(VSOCK_PORT, libc::VMADDR_CID_HOST as u32).await?;
+        let stream = vsock::VsockStream::connect(VSOCK_PORT, vsock::VMADDR_CID_HOST).await?;
         let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
         let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
             stream,
@@ -93,7 +92,11 @@ async fn serve() -> std::io::Result<()> {
 fn main() {
     setup_console();
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "Hello from rust guest-init, pid 1!");
+    let _ = writeln!(out, "guest-init: pid {}", std::process::id());
+    if let Err(e) = pid1::Pid1Settings::new().launch() {
+        let _ = writeln!(out, "guest: pid1 launch failed: {e}");
+        let _ = out.flush();
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

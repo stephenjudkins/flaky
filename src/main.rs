@@ -48,7 +48,10 @@ async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("error,alioth::board::aarch64=off"),
+    )
+    .init();
     let cmdline = String::from("console=ttyAMA0 rdinit=/init quiet");
 
     let kernel = PathBuf::from("guest/vmlinux.bin");
