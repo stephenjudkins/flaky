@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3"
-hello-rpc = { path = "../hello-rpc" }
+vm-controller-rpc = { path = "../vm-controller-rpc" }
 libc = "0.2"
 serde = "1"
 tarpc = { version = "0.36", features = ["serde-transport", "serde-transport-json"] }

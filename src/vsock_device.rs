@@ -258,15 +258,12 @@ pub struct InProcessVsock {
 
 impl InProcessVsock {
     fn allocate_port(&mut self) -> Option<u32> {
-        let mut count: u64 = 0;
-        while self.host_ports.contains_key(&self.next_port) && count < u32::MAX as u64 {
+        loop {
+            let port = self.next_port;
             self.next_port = self.next_port.wrapping_add(1);
-            count += 1;
-        }
-        if count == u32::MAX as u64 {
-            None
-        } else {
-            Some(self.next_port)
+            if !self.host_ports.contains_key(&port) {
+                return Some(port);
+            }
         }
     }
 
@@ -609,6 +606,18 @@ impl InProcessVsock {
                 buf_alloc: BUF_ALLOC,
                 ..Default::default()
             };
+            let shut = Hdr {
+                src_cid: CID_HOST,
+                dst_cid: self.guest_cid,
+                src_port: host_port,
+                dst_port: guest_port,
+                type_: TYPE_STREAM,
+                op: OP_SHUTDOWN,
+                flags: SHUTDOWN_BOTH,
+                buf_alloc: BUF_ALLOC,
+                ..Default::default()
+            }
+            .to_bytes();
             let name = &self.name;
             let reader = &mut conn.reader;
             rx_q.handle_desc(QUEUE_RX, irq_sender, |desc| {
@@ -623,7 +632,7 @@ impl InProcessVsock {
                 if nread == 0 {
                     if eof {
                         send_shutdown = true;
-                        write_shut_hdr(&mut desc.writable, host_port, guest_port);
+                        write_prefix(&mut desc.writable, &shut);
                         return Ok(Status::Done {
                             len: HDR_SIZE as u32,
                         });
@@ -669,19 +678,6 @@ fn write_prefix(bufs: &mut [IoSliceMut], bytes: &[u8]) {
 
 fn write_prefix_satisfied(bufs: &[IoSliceMut], bytes: &[u8]) -> bool {
     bufs.iter().map(|b| b.len()).sum::<usize>() >= bytes.len()
-}
-
-fn write_shut_hdr(bufs: &mut [IoSliceMut], host_port: u32, guest_port: u32) {
-    let shut = Hdr {
-        src_port: host_port,
-        dst_port: guest_port,
-        type_: TYPE_STREAM,
-        op: OP_SHUTDOWN,
-        flags: SHUTDOWN_BOTH,
-        buf_alloc: BUF_ALLOC,
-        ..Default::default()
-    };
-    write_prefix(bufs, &shut.to_bytes());
 }
 
 fn gather<const N: usize>(bufs: &[IoSlice]) -> Option<[u8; N]> {

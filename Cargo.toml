@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["guest-init", "hello-rpc"]
+members = ["guest-init", "vm-controller-rpc"]
 
 [dependencies]
 alioth = "0.12"
@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 erofs-builder = "0.1"
 flate2 = "1"
-hello-rpc = { path = "hello-rpc" }
+vm-controller-rpc = { path = "vm-controller-rpc" }
 libc = "0.2"
 log = "0.4"
 mio = "1.2.2"

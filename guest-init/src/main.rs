@@ -2,12 +2,11 @@ use std::ffi::CString;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use futures::prelude::*;
-use hello_rpc::Hello;
-use hello_rpc::tarpc::context;
-use hello_rpc::tarpc::server::{BaseChannel, Channel};
+use vm_controller_rpc::VmController;
+use vm_controller_rpc::tarpc::context;
+use vm_controller_rpc::tarpc::server::{BaseChannel, Channel};
 
 mod vsock;
 
@@ -49,11 +48,18 @@ fn poweroff() -> ! {
 }
 
 #[derive(Clone)]
-struct HelloServer;
+struct VmControllerServer {
+    shutdown_requested: Arc<AtomicBool>,
+}
 
-impl Hello for HelloServer {
+impl VmController for VmControllerServer {
     async fn hello(self, _: context::Context, x: String) -> String {
         format!("hello {x}")
+    }
+
+    async fn shutdown(self, _: context::Context) -> String {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        "shutting down".to_string()
     }
 }
 
@@ -61,31 +67,29 @@ async fn serve() -> std::io::Result<()> {
     let listener = vsock::VsockListener::bind(VSOCK_PORT)?;
     let mut out = std::io::stdout();
     let _ = writeln!(out, "guest: listening on vsock port {VSOCK_PORT}");
-    let stream = listener.accept().await?;
-    let _ = writeln!(out, "guest: accepted host connection");
-    let transport = hello_rpc::tarpc::serde_transport::Transport::from((
-        stream,
-        hello_rpc::tarpc::tokio_serde::formats::Json::default(),
-    ));
-    let answered = Arc::new(AtomicBool::new(false));
-    let channel = BaseChannel::with_defaults(transport);
-    let answered_done = answered.clone();
-    let answered_done = answered.clone();
-    tokio::select! {
-        _ = channel.execute(HelloServer.serve()).for_each(move |resp| {
-            let answered = answered_done.clone();
-            async move {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    loop {
+        let stream = listener.accept().await?;
+        let _ = writeln!(out, "guest: accepted host connection");
+        let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
+            stream,
+            vm_controller_rpc::tarpc::tokio_serde::formats::Json::default(),
+        ));
+        let channel = BaseChannel::with_defaults(transport);
+        let server = VmControllerServer {
+            shutdown_requested: shutdown_requested.clone(),
+        };
+        channel
+            .execute(server.serve())
+            .for_each(|resp| async {
                 let _ = resp.await;
-                answered.store(true, Ordering::SeqCst);
-            }
-        }) => (),
-        _ = async {
-            while !answered.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        } => (),
+            })
+            .await;
+        let _ = writeln!(out, "guest: connection closed");
+        if shutdown_requested.load(Ordering::SeqCst) {
+            poweroff();
+        }
     }
-    Ok(())
 }
 
 fn main() {

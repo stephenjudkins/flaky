@@ -1,5 +1,5 @@
 [package]
-name = "hello-rpc"
+name = "vm-controller-rpc"
 version = "0.1.0"
 edition = "2024"
 

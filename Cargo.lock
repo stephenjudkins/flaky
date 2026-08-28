@@ -637,7 +637,6 @@ dependencies = [
  "env_logger",
  "erofs-builder",
  "flate2",
- "hello-rpc",
  "libc",
  "log",
  "mio",
@@ -647,6 +646,7 @@ dependencies = [
  "tar",
  "tarpc",
  "tokio",
+ "vm-controller-rpc",
  "zstd",
 ]
 
@@ -799,11 +799,11 @@ name = "guest-init"
 version = "0.1.0"
 dependencies = [
  "futures",
- "hello-rpc",
  "libc",
  "serde",
  "tarpc",
  "tokio",
+ "vm-controller-rpc",
 ]
 
 [[package]]
@@ -817,14 +817,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hello-rpc"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tarpc",
-]
 
 [[package]]
 name = "hermit-abi"
@@ -1875,6 +1867,14 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vm-controller-rpc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tarpc",
+]
 
 [[package]]
 name = "wasi"

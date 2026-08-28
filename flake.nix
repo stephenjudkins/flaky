@@ -39,7 +39,7 @@
             filter =
               path: type:
               nixpkgs.lib.hasPrefix "${toString ./guest-init}" path
-              || nixpkgs.lib.hasPrefix "${toString ./hello-rpc}" path
+              || nixpkgs.lib.hasPrefix "${toString ./vm-controller-rpc}" path
               || nixpkgs.lib.hasPrefix "${toString ./src}" path
               || builtins.elem path [
                 (toString ./Cargo.toml)
