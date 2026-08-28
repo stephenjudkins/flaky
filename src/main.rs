@@ -10,11 +10,11 @@ use alioth::virtio::dev::entropy::EntropyParam;
 use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 
+use vm_controller_rpc::Postcard;
 use vm_controller_rpc::VmControllerClient;
 use vm_controller_rpc::tarpc::client::NewClient;
 use vm_controller_rpc::tarpc::context;
 use vm_controller_rpc::tarpc::serde_transport::Transport;
-use vm_controller_rpc::tarpc::tokio_serde::formats::Json;
 
 mod vsock_device;
 use vsock_device::{VsockHost, VsockParam};
@@ -22,7 +22,7 @@ use vsock_device::{VsockHost, VsockParam};
 async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
     let stream = vsock_host.accept().await?;
     let stream = tokio::net::UnixStream::from_std(stream)?;
-    let transport = Transport::from((stream, Json::default()));
+    let transport = Transport::from((stream, Postcard::default()));
     let NewClient { client, dispatch } = VmControllerClient::new(
         vm_controller_rpc::tarpc::client::Config::default(),
         transport,

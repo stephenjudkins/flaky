@@ -71,7 +71,7 @@ async fn serve() -> std::io::Result<()> {
         let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
         let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
             stream,
-            vm_controller_rpc::tarpc::tokio_serde::formats::Json::default(),
+            vm_controller_rpc::Postcard::default(),
         ));
         let channel = BaseChannel::with_defaults(transport);
         let server = VmControllerServer {
