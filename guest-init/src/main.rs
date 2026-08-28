@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::prelude::*;
 use nix::fcntl::OFlag;
 use nix::mount::MsFlags;
+use tokio_vsock::VMADDR_CID_HOST;
+use tokio_vsock::VsockAddr;
+use tokio_vsock::VsockStream;
 use vm_controller_rpc::VmController;
 use vm_controller_rpc::tarpc::context;
 use vm_controller_rpc::tarpc::server::{BaseChannel, Channel};
-
-mod vsock;
 
 const VSOCK_PORT: u32 = 5000;
 
@@ -66,7 +67,7 @@ async fn serve() -> std::io::Result<()> {
     let mut out = std::io::stdout();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     loop {
-        let stream = vsock::VsockStream::connect(VSOCK_PORT, vsock::VMADDR_CID_HOST).await?;
+        let stream = VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, VSOCK_PORT)).await?;
         let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
         let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
             stream,
