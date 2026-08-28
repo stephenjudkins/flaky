@@ -676,6 +676,7 @@ dependencies = [
  "env_logger",
  "erofs-builder",
  "flate2",
+ "futures",
  "libc",
  "log",
  "mio",

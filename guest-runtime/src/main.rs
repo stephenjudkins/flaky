@@ -1,18 +1,17 @@
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::prelude::*;
-use apis::VmController;
+use apis::tarpc::client::NewClient;
 use apis::tarpc::context;
 use apis::tarpc::server::{BaseChannel, Channel};
+use apis::{GUEST_API_PORT, GuestApi, HOST_API_PORT, Postcard};
+use futures::prelude::*;
 use nix::fcntl::OFlag;
 use nix::mount::MsFlags;
 use tokio_vsock::VMADDR_CID_HOST;
 use tokio_vsock::VsockAddr;
 use tokio_vsock::VsockStream;
-
-const VSOCK_PORT: u32 = 5000;
 
 fn setup_console() {
     let _ = nix::mount::mount(
@@ -48,11 +47,11 @@ fn poweroff() -> ! {
 }
 
 #[derive(Clone)]
-struct VmControllerServer {
+struct GuestApiServer {
     shutdown_requested: Arc<AtomicBool>,
 }
 
-impl VmController for VmControllerServer {
+impl GuestApi for GuestApiServer {
     async fn hello(self, _: context::Context, x: String) -> String {
         format!("hello {x}")
     }
@@ -66,15 +65,42 @@ impl VmController for VmControllerServer {
 async fn serve() -> std::io::Result<()> {
     let mut out = std::io::stdout();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+
+    let mut guest_api =
+        Some(VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, GUEST_API_PORT)).await?);
+
+    let host_api = VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, HOST_API_PORT)).await?;
+    let _ = writeln!(
+        out,
+        "guest: connected to host on vsock port {HOST_API_PORT}"
+    );
+    let transport = apis::tarpc::serde_transport::Transport::from((host_api, Postcard::default()));
+    let NewClient { client, dispatch } =
+        apis::HostApiClient::new(apis::tarpc::client::Config::default(), transport);
+    tokio::pin!(dispatch);
+    let resp = tokio::select! {
+        resp = client.greet(context::current(), "guest".to_string()) => {
+            resp.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        }
+        _ = &mut dispatch => {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "host api dispatch terminated"));
+        }
+    };
+    let _ = writeln!(out, "guest: host replied: {resp}");
+
     loop {
-        let stream = VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, VSOCK_PORT)).await?;
-        let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
-        let transport = apis::tarpc::serde_transport::Transport::from((
-            stream,
-            apis::Postcard::default(),
-        ));
+        let stream = match guest_api.take() {
+            Some(stream) => stream,
+            None => VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, GUEST_API_PORT)).await?,
+        };
+        let _ = writeln!(
+            out,
+            "guest: connected to host on vsock port {GUEST_API_PORT}"
+        );
+        let transport =
+            apis::tarpc::serde_transport::Transport::from((stream, Postcard::default()));
         let channel = BaseChannel::with_defaults(transport);
-        let server = VmControllerServer {
+        let server = GuestApiServer {
             shutdown_requested: shutdown_requested.clone(),
         };
         channel

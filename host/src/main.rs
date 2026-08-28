@@ -10,28 +10,54 @@ use alioth::virtio::dev::entropy::EntropyParam;
 use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 
+use apis::GuestApiClient;
+use apis::HostApi;
 use apis::Postcard;
-use apis::VmControllerClient;
 use apis::tarpc::client::NewClient;
 use apis::tarpc::context;
 use apis::tarpc::serde_transport::Transport;
+use apis::tarpc::server::BaseChannel;
+use apis::tarpc::server::Channel;
+use apis::{GUEST_API_PORT, HOST_API_PORT};
+use futures::prelude::*;
 
 mod vsock_device;
 use vsock_device::{VsockHost, VsockParam};
 
+#[derive(Clone)]
+struct HostApiServer;
+
+impl HostApi for HostApiServer {
+    async fn greet(self, _: context::Context, x: String) -> String {
+        format!("hello from host: {x}")
+    }
+}
+
 async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
-    let stream = vsock_host.accept().await?;
-    let stream = tokio::net::UnixStream::from_std(stream)?;
-    let transport = Transport::from((stream, Postcard::default()));
+    let guest_api_stream =
+        tokio::net::UnixStream::from_std(vsock_host.accept(GUEST_API_PORT).await?)?;
+    let transport = Transport::from((guest_api_stream, Postcard::default()));
     let NewClient { client, dispatch } =
-        VmControllerClient::new(apis::tarpc::client::Config::default(), transport);
+        GuestApiClient::new(apis::tarpc::client::Config::default(), transport);
     tokio::pin!(dispatch);
+
+    let host_api_stream =
+        tokio::net::UnixStream::from_std(vsock_host.accept(HOST_API_PORT).await?)?;
+    let host_transport = Transport::from((host_api_stream, Postcard::default()));
+    let channel = BaseChannel::with_defaults(host_transport);
+    let host_server = channel
+        .execute(HostApiServer.serve())
+        .for_each(|resp| async {
+            let _ = resp.await;
+        });
+    tokio::pin!(host_server);
 
     let resp = tokio::select! {
         resp = client.hello(context::current(), "world".to_string()) => {
             resp.map_err(|e| anyhow::anyhow!("rpc call: {e}"))?
         }
         _ = &mut dispatch => anyhow::bail!("dispatch terminated"),
+        _ = &mut host_server => anyhow::bail!("host api server terminated"),
     };
     println!("host: guest replied: {resp}");
 
@@ -40,6 +66,7 @@ async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
             resp.map_err(|e| anyhow::anyhow!("rpc call: {e}"))?
         }
         _ = &mut dispatch => anyhow::bail!("dispatch terminated"),
+        _ = &mut host_server => anyhow::bail!("host api server terminated"),
     };
     println!("host: guest replied: {resp}");
     Ok(())

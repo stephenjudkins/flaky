@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write};
 use std::num::Wrapping;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -163,9 +163,15 @@ impl Connection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct PortState {
+    queue: VecDeque<UnixStream>,
+    listener: Option<tokio::sync::oneshot::Sender<UnixStream>>,
+}
+
+#[derive(Debug, Default)]
 struct Shared {
-    listener: Mutex<Option<tokio::sync::oneshot::Sender<UnixStream>>>,
+    ports: Mutex<HashMap<u32, PortState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,9 +180,17 @@ pub struct VsockHost {
 }
 
 impl VsockHost {
-    pub async fn accept(&self) -> io::Result<UnixStream> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.shared.listener.lock().unwrap().replace(sender);
+    pub async fn accept(&self, port: u32) -> io::Result<UnixStream> {
+        let receiver = {
+            let mut ports = self.shared.ports.lock().unwrap();
+            let state = ports.entry(port).or_default();
+            if let Some(stream) = state.queue.pop_front() {
+                return Ok(stream);
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            state.listener = Some(sender);
+            receiver
+        };
         receiver
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "vsock device dropped"))
@@ -191,9 +205,7 @@ pub struct VsockParam {
 
 impl VsockParam {
     pub fn new(cid: u32) -> (Self, VsockHost) {
-        let shared = Arc::new(Shared {
-            listener: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::default());
         (
             VsockParam {
                 cid,
@@ -245,10 +257,6 @@ impl InProcessVsock {
         S: IrqSender,
     {
         let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
-        let Some(sender) = self.shared.listener.lock().unwrap().take() else {
-            log::warn!("{}: no host listener for port {host_port}", self.name);
-            return self.respond_rst(hdr, irq_sender, rx_q);
-        };
         let (host_end, dev_end) = match socketpair() {
             Ok(pair) => pair,
             Err(e) => {
@@ -292,7 +300,13 @@ impl InProcessVsock {
         );
         self.connections.insert((host_port, guest_port), conn);
         self.ports.insert(token, (host_port, guest_port));
-        let _ = sender.send(host_end);
+        let mut ports = self.shared.ports.lock().unwrap();
+        let state = ports.entry(host_port).or_default();
+        if let Some(sender) = state.listener.take() {
+            let _ = sender.send(host_end);
+        } else {
+            state.queue.push_back(host_end);
+        }
         Ok(())
     }
 
