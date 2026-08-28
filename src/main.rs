@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use alioth::board::{BoardConfig, CpuConfig};
@@ -8,7 +8,6 @@ use alioth::loader::{Executable, Payload};
 use alioth::mem::{MemBackend, MemConfig};
 use alioth::virtio::dev::blk::BlkFileParam;
 use alioth::virtio::dev::entropy::EntropyParam;
-use alioth::virtio::dev::vsock::UdsVsockParam;
 use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 
@@ -17,13 +16,15 @@ use hello_rpc::tarpc::context;
 use hello_rpc::tarpc::serde_transport::Transport;
 use hello_rpc::tarpc::tokio_serde::formats::Json;
 
-const VSOCK_SOCK: &str = "guest/vsock.sock";
+mod vsock_device;
+use vsock_device::{VsockHost, VsockParam};
+
 const VSOCK_PORT: u32 = 5000;
 
-async fn call_hello() -> anyhow::Result<String> {
+async fn call_hello(vsock_host: &VsockHost) -> anyhow::Result<String> {
     let mut last_err = None;
     for _ in 0..50 {
-        match try_call_hello().await {
+        match try_call_hello(vsock_host).await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 eprintln!("host: rpc attempt failed: {e:#}");
@@ -38,29 +39,9 @@ async fn call_hello() -> anyhow::Result<String> {
     ))
 }
 
-async fn try_call_hello() -> anyhow::Result<String> {
-    let mut stream = tokio::net::UnixStream::connect(VSOCK_SOCK).await?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream
-        .write_all(format!("CONNECT {VSOCK_PORT}\n").as_bytes())
-        .await?;
-    let mut line = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            anyhow::bail!("eof waiting for OK handshake");
-        }
-        line.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    anyhow::ensure!(
-        line.starts_with(b"OK "),
-        "unexpected vsock handshake: {:?}",
-        String::from_utf8_lossy(&line)
-    );
+async fn try_call_hello(vsock_host: &VsockHost) -> anyhow::Result<String> {
+    let stream = vsock_host.connect(VSOCK_PORT)?;
+    let stream = tokio::net::UnixStream::from_std(stream)?;
     let transport = Transport::from((stream, Json::default()));
     let client = HelloClient::new(hello_rpc::tarpc::client::Config::default(), transport).spawn();
     let resp = client
@@ -104,14 +85,8 @@ fn main() -> anyhow::Result<()> {
         },
     )?;
     vm.add_virtio_dev("virtio-rng", EntropyParam::default())?;
-    let _ = std::fs::remove_file(Path::new(VSOCK_SOCK));
-    vm.add_virtio_dev(
-        "virtio-vsock",
-        UdsVsockParam {
-            cid: 3,
-            path: PathBuf::from(VSOCK_SOCK).into_boxed_path(),
-        },
-    )?;
+    let (vsock_param, vsock_host) = VsockParam::new(3)?;
+    vm.add_virtio_dev("virtio-vsock", vsock_param)?;
 
     vm.add_payload(Payload {
         executable: Some(Executable::Linux(kernel.into())),
@@ -125,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let resp = rt.block_on(call_hello())?;
+    let resp = rt.block_on(call_hello(&vsock_host))?;
     println!("host: guest replied: {resp}");
 
     vm.wait()?;

@@ -3,6 +3,9 @@ name = "flaky"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["guest-init", "hello-rpc"]
+
 [dependencies]
 alioth = "0.12"
 anyhow = "1"
@@ -12,11 +15,16 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 erofs-builder = "0.1"
 flate2 = "1"
+hello-rpc = { path = "hello-rpc" }
+libc = "0.2"
 log = "0.4"
+mio = "1.2.2"
 oci-spec = "0.10"
+serde = "1"
 serde_json = "1"
+tarpc = { version = "0.36", features = ["serde-transport", "serde-transport-json"] }
 tar = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
 zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]

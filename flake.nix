@@ -34,11 +34,25 @@
         pkgs:
         let
           bp = pkgs.buildPackages;
+          src = nixpkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              nixpkgs.lib.hasPrefix "${toString ./guest-init}" path
+              || nixpkgs.lib.hasPrefix "${toString ./hello-rpc}" path
+              || nixpkgs.lib.hasPrefix "${toString ./src}" path
+              || builtins.elem path [
+                (toString ./Cargo.toml)
+                (toString ./Cargo.lock)
+                (toString ./build.rs)
+              ];
+          };
           guest-init = pkgs.rustPlatform.buildRustPackage {
             pname = "guest-init";
             version = "0.1.0";
-            src = ./guest-init;
-            cargoLock.lockFile = ./guest-init/Cargo.lock;
+            inherit src;
+            buildAndTestSubdir = "guest-init";
+            cargoLock.lockFile = ./Cargo.lock;
           };
           initramfs = bp.runCommand "initramfs.cpio.gz"
             {
