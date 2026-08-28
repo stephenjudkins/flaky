@@ -40,11 +40,10 @@
               path: type:
               nixpkgs.lib.hasPrefix "${toString ./guest-init}" path
               || nixpkgs.lib.hasPrefix "${toString ./vm-controller-rpc}" path
-              || nixpkgs.lib.hasPrefix "${toString ./src}" path
+              || nixpkgs.lib.hasPrefix "${toString ./host}" path
               || builtins.elem path [
                 (toString ./Cargo.toml)
                 (toString ./Cargo.lock)
-                (toString ./build.rs)
               ];
           };
           guest-init = pkgs.pkgsStatic.rustPlatform.buildRustPackage {

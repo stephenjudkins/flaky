@@ -1,11 +1,11 @@
 [package]
 name = "vm-controller-rpc"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-bytes = "1"
-postcard = { version = "1", default-features = false, features = ["use-std", "alloc"] }
-serde = "1"
-tarpc = { version = "0.36", features = ["serde-transport"] }
-tokio-serde = { version = "0.9", default-features = false }
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tarpc.workspace = true
+tokio-serde.workspace = true

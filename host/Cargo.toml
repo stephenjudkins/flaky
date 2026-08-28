@@ -1,0 +1,25 @@
+[package]
+name = "flaky"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alioth.workspace = true
+anyhow.workspace = true
+arcbox-ext4.workspace = true
+backhand.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+erofs-builder.workspace = true
+flate2.workspace = true
+libc.workspace = true
+log.workspace = true
+mio.workspace = true
+oci-spec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tarpc = { workspace = true, features = ["serde-transport-json"] }
+tokio = { workspace = true, features = ["sync"] }
+vm-controller-rpc.workspace = true
+zstd.workspace = true
