@@ -64,13 +64,11 @@ impl VmController for VmControllerServer {
 }
 
 async fn serve() -> std::io::Result<()> {
-    let listener = vsock::VsockListener::bind(VSOCK_PORT)?;
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "guest: listening on vsock port {VSOCK_PORT}");
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     loop {
-        let stream = listener.accept().await?;
-        let _ = writeln!(out, "guest: accepted host connection");
+        let stream = vsock::VsockStream::connect(VSOCK_PORT, libc::VMADDR_CID_HOST as u32).await?;
+        let _ = writeln!(out, "guest: connected to host on vsock port {VSOCK_PORT}");
         let transport = vm_controller_rpc::tarpc::serde_transport::Transport::from((
             stream,
             vm_controller_rpc::tarpc::tokio_serde::formats::Json::default(),

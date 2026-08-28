@@ -14,66 +14,64 @@ fn make_addr(port: u32, cid: u32) -> libc::sockaddr_vm {
     addr
 }
 
-pub struct VsockListener {
-    fd: OwnedFd,
-}
-
-impl VsockListener {
-    pub fn bind(port: u32) -> io::Result<Self> {
-        unsafe {
-            let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let addr = make_addr(port, libc::VMADDR_CID_ANY);
-            if libc::bind(
-                fd,
-                (&addr as *const libc::sockaddr_vm).cast(),
-                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-            ) < 0
-            {
-                let err = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-            if libc::listen(fd, 16) < 0 {
-                let err = io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-            Ok(Self {
-                fd: OwnedFd::from_raw_fd(fd),
-            })
-        }
-    }
-
-    pub async fn accept(&self) -> io::Result<VsockStream> {
-        let listener = AsyncFd::new(self.fd.try_clone()?)?;
-        loop {
-            let conn = unsafe {
-                libc::accept4(
-                    self.fd.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    libc::SOCK_CLOEXEC,
-                )
-            };
-            if conn >= 0 {
-                return Ok(VsockStream {
-                    fd: AsyncFd::new(unsafe { OwnedFd::from_raw_fd(conn) })?,
-                });
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::WouldBlock {
-                return Err(err);
-            }
-            listener.readable().await?;
-        }
-    }
-}
-
 pub struct VsockStream {
     fd: AsyncFd<OwnedFd>,
+}
+
+impl VsockStream {
+    pub async fn connect(port: u32, cid: u32) -> io::Result<VsockStream> {
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        unsafe {
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            if libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let addr = make_addr(port, cid);
+        let rc = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                (&addr as *const libc::sockaddr_vm).cast(),
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINPROGRESS)
+                && err.kind() != io::ErrorKind::WouldBlock
+            {
+                return Err(err);
+            }
+        }
+        let fd = AsyncFd::new(fd)?;
+        loop {
+            let mut guard = fd.writable().await?;
+            let mut so_err: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut so_err as *mut libc::c_int).cast(),
+                    &mut len,
+                );
+            }
+            let _ = guard.clear_ready();
+            if so_err == 0 {
+                return Ok(VsockStream { fd });
+            }
+            let err = io::Error::from_raw_os_error(so_err);
+            if so_err == libc::EINPROGRESS {
+                continue;
+            }
+            return Err(err);
+        }
+    }
 }
 
 impl AsyncRead for VsockStream {

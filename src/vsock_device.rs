@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write};
 use std::num::Wrapping;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -138,21 +138,8 @@ fn socketpair() -> io::Result<(UnixStream, UnixStream)> {
     })
 }
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as RawFd; 2];
-    unsafe {
-        if libc::pipe(fds.as_mut_ptr()) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    set_flags(fds[0])?;
-    set_flags(fds[1])?;
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
 #[derive(Debug)]
 enum ConnState {
-    Requested,
     Established { fwd_cnt: Wrapping<u32> },
     Shutdown { flags: u32 },
 }
@@ -165,9 +152,11 @@ struct Connection {
 }
 
 impl Connection {
-    fn of(stream: UnixStream) -> io::Result<Self> {
+    fn established(stream: UnixStream) -> io::Result<Self> {
         Ok(Connection {
-            state: ConnState::Requested,
+            state: ConnState::Established {
+                fwd_cnt: Wrapping(0),
+            },
             writer: stream.try_clone()?,
             reader: stream,
         })
@@ -176,8 +165,7 @@ impl Connection {
 
 #[derive(Debug)]
 struct Shared {
-    pending: Mutex<Vec<(u32, UnixStream)>>,
-    wake_write: OwnedFd,
+    listener: Mutex<Option<tokio::sync::oneshot::Sender<UnixStream>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -186,14 +174,12 @@ pub struct VsockHost {
 }
 
 impl VsockHost {
-    pub fn connect(&self, port: u32) -> io::Result<UnixStream> {
-        let (host_end, dev_end) = socketpair()?;
-        self.shared.pending.lock().unwrap().push((port, dev_end));
-        let byte = [1u8];
-        unsafe {
-            let _ = libc::write(self.shared.wake_write.as_raw_fd(), byte.as_ptr().cast(), 1);
-        }
-        Ok(host_end)
+    pub async fn accept(&self) -> io::Result<UnixStream> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.shared.listener.lock().unwrap().replace(sender);
+        receiver
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "vsock device dropped"))
     }
 }
 
@@ -201,24 +187,20 @@ impl VsockHost {
 pub struct VsockParam {
     cid: u32,
     shared: Arc<Shared>,
-    wake_read: OwnedFd,
 }
 
 impl VsockParam {
-    pub fn new(cid: u32) -> io::Result<(Self, VsockHost)> {
-        let (wake_read, wake_write) = pipe()?;
+    pub fn new(cid: u32) -> (Self, VsockHost) {
         let shared = Arc::new(Shared {
-            pending: Mutex::new(Vec::new()),
-            wake_write,
+            listener: Mutex::new(None),
         });
-        Ok((
+        (
             VsockParam {
                 cid,
                 shared: shared.clone(),
-                wake_read,
             },
             VsockHost { shared },
-        ))
+        )
     }
 }
 
@@ -234,11 +216,8 @@ impl DevParam for VsockParam {
             }),
             guest_cid: self.cid,
             shared: self.shared,
-            wake_read: self.wake_read,
             connections: HashMap::new(),
             ports: HashMap::new(),
-            host_ports: HashMap::new(),
-            next_port: 1024,
         })
     }
 }
@@ -249,94 +228,71 @@ pub struct InProcessVsock {
     config: Arc<VsockConfig>,
     guest_cid: u32,
     shared: Arc<Shared>,
-    wake_read: OwnedFd,
     connections: HashMap<(u32, u32), Connection>,
     ports: HashMap<Token, (u32, u32)>,
-    host_ports: HashMap<u32, u32>,
-    next_port: u32,
 }
 
 impl InProcessVsock {
-    fn allocate_port(&mut self) -> Option<u32> {
-        loop {
-            let port = self.next_port;
-            self.next_port = self.next_port.wrapping_add(1);
-            if !self.host_ports.contains_key(&port) {
-                return Some(port);
-            }
-        }
-    }
-
-    fn drain_wake_pipe(&self) {
-        let mut buf = [0u8; 64];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.wake_read.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                )
-            };
-            if n < buf.len() as isize {
-                break;
-            }
-        }
-    }
-
-    fn process_pending<'m, Q, S>(
+    fn handle_tx_request<'m, Q, S>(
         &mut self,
+        hdr: &Hdr,
         registry: &Registry,
-        rx_q: &mut Queue<'_, 'm, Q>,
         irq_sender: &S,
+        rx_q: &mut Queue<'_, 'm, Q>,
     ) -> Result<()>
     where
         Q: VirtQueue<'m>,
         S: IrqSender,
     {
-        loop {
-            let pending = self.shared.pending.lock().unwrap().pop();
-            let Some((guest_port, dev_end)) = pending else {
-                break;
-            };
-            let Some(host_port) = self.allocate_port() else {
-                log::error!("{}: failed to allocate host port", self.name);
-                continue;
-            };
-            let token = Token(dev_end.as_raw_fd() as usize);
-            if let Err(e) = registry.register(
-                &mut SourceFd(&dev_end.as_raw_fd()),
-                token,
-                Interest::READABLE,
-            ) {
-                log::error!("{}: failed to register socket: {e}", self.name);
-                continue;
+        let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
+        let Some(sender) = self.shared.listener.lock().unwrap().take() else {
+            log::warn!("{}: no host listener for port {host_port}", self.name);
+            return self.respond_rst(hdr, irq_sender, rx_q);
+        };
+        let (host_end, dev_end) = match socketpair() {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::error!("{}: failed to create socketpair: {e}", self.name);
+                return self.respond_rst(hdr, irq_sender, rx_q);
             }
-            let hdr = Hdr {
-                src_cid: CID_HOST,
-                dst_cid: self.guest_cid,
-                src_port: host_port,
-                dst_port: guest_port,
-                type_: TYPE_STREAM,
-                op: OP_REQUEST,
-                buf_alloc: BUF_ALLOC,
-                ..Default::default()
-            };
-            if let Err(e) = self.respond(&hdr, irq_sender, rx_q) {
-                log::error!("{}: failed to send connection request: {e:?}", self.name);
-                let _ = registry.deregister(&mut SourceFd(&dev_end.as_raw_fd()));
-                continue;
-            }
-            match Connection::of(dev_end) {
-                Ok(conn) => {
-                    self.connections.insert((host_port, guest_port), conn);
-                    self.ports.insert(token, (host_port, guest_port));
-                    *self.host_ports.entry(host_port).or_default() += 1;
-                }
-                Err(e) => {
-                    log::error!("{}: failed to init connection: {e:?}", self.name);
-                }
-            }
+        };
+        let response = Hdr {
+            src_cid: CID_HOST,
+            dst_cid: self.guest_cid,
+            src_port: host_port,
+            dst_port: guest_port,
+            type_: TYPE_STREAM,
+            op: OP_RESPONSE,
+            buf_alloc: BUF_ALLOC,
+            ..Default::default()
+        };
+        if let Err(e) = self.respond(&response, irq_sender, rx_q) {
+            log::error!("{}: failed to send connection response: {e:?}", self.name);
+            return self.respond_rst(hdr, irq_sender, rx_q);
         }
+        let conn = match Connection::established(dev_end) {
+            Ok(conn) => conn,
+            Err(e) => {
+                log::error!("{}: failed to init connection: {e:?}", self.name);
+                return Ok(());
+            }
+        };
+        let token = Token(conn.reader.as_raw_fd() as usize);
+        if let Err(e) = registry.register(
+            &mut SourceFd(&conn.reader.as_raw_fd()),
+            token,
+            Interest::READABLE,
+        ) {
+            log::error!("{}: failed to register socket: {e}", self.name);
+            return Ok(());
+        }
+        log::debug!(
+            "{}: vm:{guest_port} -> host:{host_port}: established (guest-initiated)",
+            self.name
+        );
+        self.connections.insert((host_port, guest_port), conn);
+        self.ports.insert(token, (host_port, guest_port));
+        let _ = sender.send(host_end);
         Ok(())
     }
 
@@ -405,55 +361,8 @@ impl InProcessVsock {
         };
         let token = Token(conn.reader.as_raw_fd() as usize);
         self.ports.remove(&token);
-        if let Some(count) = self.host_ports.get_mut(&host_port) {
-            if *count == 1 {
-                self.host_ports.remove(&host_port);
-            } else {
-                *count -= 1;
-            }
-        }
         registry.deregister(&mut SourceFd(&conn.reader.as_raw_fd()))?;
         Ok(())
-    }
-
-    fn handle_tx_response<'m, Q, S>(
-        &mut self,
-        hdr: &Hdr,
-        registry: &Registry,
-        rx_q: &mut Queue<'_, 'm, Q>,
-        irq_sender: &S,
-    ) -> Result<()>
-    where
-        Q: VirtQueue<'m>,
-        S: IrqSender,
-    {
-        let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
-        let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) else {
-            log::warn!(
-                "{}: vm:{guest_port} -> host:{host_port}: unknown connection",
-                self.name
-            );
-            return Ok(());
-        };
-        match conn.state {
-            ConnState::Requested => {
-                conn.state = ConnState::Established {
-                    fwd_cnt: Wrapping(0),
-                };
-                log::debug!(
-                    "{}: vm:{guest_port} -> host:{host_port}: established",
-                    self.name
-                );
-            }
-            ref other => {
-                log::error!(
-                    "{}: vm:{guest_port} -> host:{host_port}: found {other:?}, expect Requested",
-                    self.name
-                );
-                return Ok(());
-            }
-        }
-        self.transfer_rx_data(host_port, guest_port, registry, rx_q, irq_sender)
     }
 
     fn handle_tx_shutdown(&mut self, hdr: &Hdr, registry: &Registry) -> Result<()> {
@@ -506,16 +415,15 @@ impl InProcessVsock {
             hdr.op
         );
         match hdr.op {
-            OP_RESPONSE => self.handle_tx_response(&hdr, registry, rx_q, irq_sender)?,
+            OP_REQUEST => {
+                self.handle_tx_request(&hdr, registry, irq_sender, rx_q)?;
+                self.transfer_rx_data(hdr.dst_port, hdr.src_port, registry, rx_q, irq_sender)?;
+            }
             OP_RST => {
                 self.remove_conn(hdr.dst_port, hdr.src_port, registry)?;
             }
             OP_SHUTDOWN => self.handle_tx_shutdown(&hdr, registry)?,
             OP_RW => self.transfer_tx_data(&hdr, &desc.readable)?,
-            OP_REQUEST => {
-                log::warn!("{}: guest-initiated connections unsupported", self.name);
-                self.respond_rst(&hdr, irq_sender, rx_q)?;
-            }
             OP_CREDIT_UPDATE | OP_CREDIT_REQUEST => {}
             other => log::error!("{}: unsupported op {other}", self.name),
         }
@@ -775,18 +683,13 @@ impl VirtioMio for InProcessVsock {
     fn activate<'m, Q, S, E>(
         &mut self,
         _feature: u128,
-        active_mio: &mut ActiveMio<'_, '_, 'm, Q, S, E>,
+        _active_mio: &mut ActiveMio<'_, '_, 'm, Q, S, E>,
     ) -> Result<()>
     where
         Q: VirtQueue<'m>,
         S: IrqSender,
         E: IoeventFd,
     {
-        active_mio.poll.registry().register(
-            &mut SourceFd(&self.wake_read.as_raw_fd()),
-            Token(self.wake_read.as_raw_fd() as usize),
-            Interest::READABLE,
-        )?;
         Ok(())
     }
 
@@ -807,10 +710,7 @@ impl VirtioMio for InProcessVsock {
             log::error!("{}: rx queue not ready", self.name);
             return Ok(());
         };
-        if token.0 == self.wake_read.as_raw_fd() as usize {
-            self.drain_wake_pipe();
-            self.process_pending(registry, rx_q, irq_sender)
-        } else if let Some(&(host_port, guest_port)) = self.ports.get(&token) {
+        if let Some(&(host_port, guest_port)) = self.ports.get(&token) {
             self.transfer_rx_data(host_port, guest_port, registry, rx_q, irq_sender)
         } else {
             log::error!("{}: invalid token: {token:#?}", self.name);
@@ -860,11 +760,6 @@ impl VirtioMio for InProcessVsock {
                 log::error!("{}: failed to deregister socket: {err}", self.name);
             }
         }
-        if let Err(err) = registry.deregister(&mut SourceFd(&self.wake_read.as_raw_fd())) {
-            log::error!("{}: failed to deregister wake pipe: {err}", self.name);
-        }
         self.ports.clear();
-        self.host_ports.clear();
-        self.next_port = 1024;
     }
 }
