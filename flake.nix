@@ -199,7 +199,7 @@
             {
               nativeBuildInputs = [
                 bp.cpio
-                bp.gzip
+                bp.lz4
               ];
               closure = bp.closureInfo { rootPaths = [ guest-runtime ]; };
             }
@@ -210,7 +210,7 @@
                 cp -R "$p" "$root/nix/store/"
               done < "$closure/store-paths"
               ln -s ${guest-runtime}/bin/guest-runtime $root/init
-              (cd "$root" && find . | LC_ALL=C sort | cpio -o -H newc --reproducible | gzip -9n) > $out
+              (cd "$root" && find . | LC_ALL=C sort | cpio -o -H newc --reproducible | lz4 -l -9 --favor-decSpeed) > $out
             '';
         in
         {
