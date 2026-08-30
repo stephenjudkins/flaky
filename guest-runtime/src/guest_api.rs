@@ -1,0 +1,33 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use apis::GuestApi;
+use apis::tarpc::context;
+
+#[derive(Clone)]
+pub struct GuestApiServer {
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+impl GuestApiServer {
+    pub fn new() -> Self {
+        GuestApiServer {
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+}
+
+impl GuestApi for GuestApiServer {
+    async fn hello(self, _: context::Context, x: String) -> String {
+        format!("hello {x}")
+    }
+
+    async fn shutdown(self, _: context::Context) -> String {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        "shutting down".to_string()
+    }
+}
