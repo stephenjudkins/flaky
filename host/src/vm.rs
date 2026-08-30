@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use alioth::board::{BoardConfig, CpuConfig};
 use alioth::hv::Hvf;
@@ -32,6 +33,9 @@ pub struct Vm {
     machine: Machine<Hvf>,
     vsock_host: VsockHost,
 }
+
+const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Vm {
     pub fn boot(spec: VmSpec) -> anyhow::Result<Vm> {
@@ -103,10 +107,20 @@ impl Vm {
             .build()?;
         rt.block_on(async {
             let guest_api_stream = tokio::net::UnixStream::from_std(
-                self.vsock_host.accept(apis::GUEST_API_PORT).await?,
+                tokio::time::timeout(
+                    GUEST_CONNECT_TIMEOUT,
+                    self.vsock_host.accept(apis::GUEST_API_PORT),
+                )
+                .await
+                .context("timed out waiting for guest api connection")??,
             )?;
             let host_api_stream = tokio::net::UnixStream::from_std(
-                self.vsock_host.accept(apis::HOST_API_PORT).await?,
+                tokio::time::timeout(
+                    GUEST_CONNECT_TIMEOUT,
+                    self.vsock_host.accept(apis::HOST_API_PORT),
+                )
+                .await
+                .context("timed out waiting for host api connection")??,
             )?;
             let mut conn = GuestApiConnection::new(guest_api_stream);
             let host_api = rpc::serve_host_api(host_api_stream, HostApiServer);
@@ -120,13 +134,15 @@ impl Vm {
                 _ = &mut host_api => anyhow::bail!("host api server terminated"),
             };
             // always ask the guest to power off so vm.wait() completes
-            let _ = conn
-                .drive(|c| async move {
+            let _ = tokio::time::timeout(
+                SHUTDOWN_TIMEOUT,
+                conn.drive(|c| async move {
                     c.shutdown(context::current())
                         .await
                         .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                })
-                .await;
+                }),
+            )
+            .await;
             result
         })
     }

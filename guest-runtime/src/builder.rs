@@ -166,19 +166,9 @@ fn setup_mounts(req: &BuildRequest) -> std::io::Result<()> {
     }
     println!("guest: all {} inputs mounted", req.inputs.len());
 
-    for out in &req.outputs {
-        fs::create_dir_all(&out.store_path)?;
-        mount_err(
-            mount(
-                Some("tmpfs"),
-                out.store_path.as_str(),
-                Some("tmpfs"),
-                MsFlags::empty(),
-                Some("mode=0755"),
-            ),
-            &format!("mount tmpfs on {}", out.store_path),
-        )?;
-    }
+    // outputs are deliberately NOT pre-created: like real nix, builders
+    // must mkdir (or write a file at) $out themselves, and pack_output
+    // handles both directory and file outputs
     Ok(())
 }
 

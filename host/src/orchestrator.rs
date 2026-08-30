@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use apis::{BuildRequest, BuildResult, InputSpec, OutputSpec};
@@ -82,6 +83,8 @@ pub fn run(opts: BuildOpts) -> anyhow::Result<String> {
         for dp in ctx.plan.to_build.clone() {
             needed.extend(ctx.input_set(&dp)?);
         }
+        // ensure root outputs materialize even when the whole closure is cached
+        needed.extend(drvs[&root].outputs.values().map(|o| o.path.clone()));
         let building: BTreeSet<String> = ctx.plan.to_build.clone().into_iter().collect();
         let fetchable: Vec<String> = needed
             .into_iter()
@@ -113,7 +116,6 @@ async fn plan<'a>(
     opts: &'a BuildOpts,
 ) -> anyhow::Result<Ctx<'a>> {
     let cache = NixCache::new(&opts.cache_url).context("creating cache client")?;
-    let root_outputs: BTreeSet<&String> = drvs[root].outputs.values().map(|o| &o.path).collect();
 
     for d in ["erofs", "build", "tmp"] {
         std::fs::create_dir_all(opts.cache_dir.join(d))?;
@@ -122,11 +124,7 @@ async fn plan<'a>(
     // images carried over from earlier sessions
     // look up narinfo for every fetchable path: the References lines drive
     // input-set computation even when the image is already cached
-    let to_lookup: Vec<&String> = closure
-        .store_paths
-        .iter()
-        .filter(|p| !root_outputs.contains(p))
-        .collect();
+    let to_lookup: Vec<&String> = closure.store_paths.iter().collect();
     let mut images: BTreeMap<String, PathBuf> = BTreeMap::new();
     for p in &to_lookup {
         let img = image_path(opts, p);
@@ -165,8 +163,6 @@ async fn plan<'a>(
             }
         }
     }
-    // never fetch the root from the cache: always build it
-    to_build.insert(root.to_string());
 
     Ok(Ctx {
         drvs,
@@ -546,7 +542,7 @@ fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
     })
     .context("booting build vm")?;
     let result: BuildResult = vm.run_build(request).context("running build in vm")?;
-    vm.wait().context("waiting for vm shutdown")?;
+    reap_vm(vm, Duration::from_secs(60));
 
     if !result.success {
         bail!(
@@ -581,7 +577,23 @@ fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+fn reap_vm(vm: Vm, timeout: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(vm.wait());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(r) => {
+            if let Err(e) = r {
+                eprintln!("warning: vm exited with error: {e:#}");
+            }
+        }
+        Err(_) => eprintln!(
+            "warning: vm did not power off within {timeout:?}; continuing with vm still running"
+        ),
+    }
+}
+
 mod tests {
     use super::*;
 
