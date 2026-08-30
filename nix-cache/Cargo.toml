@@ -1,0 +1,16 @@
+[package]
+name = "nix-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-compression.workspace = true
+erofs-builder.workspace = true
+futures.workspace = true
+nar-to-erofs.workspace = true
+narinfo.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

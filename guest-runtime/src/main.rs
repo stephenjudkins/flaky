@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use nix::fcntl::OFlag;
 use nix::mount::MsFlags;
 
+mod builder;
 mod guest_api;
 mod rpc;
 mod session;

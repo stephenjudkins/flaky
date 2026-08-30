@@ -1,0 +1,9 @@
+[package]
+name = "nar-to-erofs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+erofs-builder.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

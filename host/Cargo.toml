@@ -8,6 +8,7 @@ alioth.workspace = true
 anyhow.workspace = true
 arcbox-ext4.workspace = true
 backhand.workspace = true
+base64.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 erofs-builder.workspace = true
@@ -16,11 +17,29 @@ futures.workspace = true
 libc.workspace = true
 log.workspace = true
 mio.workspace = true
+nix-cache.workspace = true
+nix-drv.workspace = true
+nar-to-erofs.workspace = true
 oci-spec.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tar.workspace = true
 tarpc = { workspace = true, features = ["serde-transport-json"] }
-tokio = { workspace = true, features = ["sync"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt", "macros", "net", "time"] }
 apis.workspace = true
 zstd.workspace = true
+
+[[bin]]
+name = "flaky"
+path = "src/main.rs"
+
+[[bin]]
+name = "oci2erofs"
+path = "src/bin/oci2erofs.rs"
+
+[[bin]]
+name = "oci2ext4"
+path = "src/bin/oci2ext4.rs"

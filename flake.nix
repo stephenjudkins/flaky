@@ -41,6 +41,9 @@
               nixpkgs.lib.hasPrefix "${toString ./guest-runtime}" path
               || nixpkgs.lib.hasPrefix "${toString ./apis}" path
               || nixpkgs.lib.hasPrefix "${toString ./host}" path
+              || nixpkgs.lib.hasPrefix "${toString ./nix-drv}" path
+              || nixpkgs.lib.hasPrefix "${toString ./nar-to-erofs}" path
+              || nixpkgs.lib.hasPrefix "${toString ./nix-cache}" path
               || builtins.elem path [
                 (toString ./Cargo.toml)
                 (toString ./Cargo.lock)
@@ -53,6 +56,36 @@
             buildAndTestSubdir = "guest-runtime";
             cargoLock.lockFile = ./Cargo.lock;
           };
+          guest-kernel-base = pkgs.linux_latest.override {
+            enableCommonConfig = false;
+            autoModules = false;
+            structuredExtraConfig = with pkgs.lib.kernel; {
+              MODULES = no;
+              DEBUG_INFO_NONE = yes;
+              DEVTMPFS = yes;
+              DEVTMPFS_MOUNT = yes;
+              PCI_HOST_GENERIC = yes;
+              SERIAL_AMBA_PL011 = yes;
+              SERIAL_AMBA_PL011_CONSOLE = yes;
+              EROFS_FS = yes;
+              EROFS_FS_BACKED_BY_FILE = yes;
+              FUSE_FS = yes;
+              VIRTIO_FS = yes;
+              VSOCKETS = yes;
+              VIRTIO_VSOCKETS = yes;
+              VIRTIO_BLK = yes;
+              HW_RANDOM_VIRTIO = yes;
+            };
+          };
+          # kernel 7.x modules_install no longer creates the build symlink,
+          # and MODULES=n never produces Module.symvers, so replace nixpkgs'
+          # module-build postInstall with a minimal one
+          guest-kernel = guest-kernel-base.overrideAttrs (_: prev: {
+            postInstall = ''
+              mkdir -p $dev $modules
+              cp vmlinux $dev/
+            '';
+          });
           initramfs = bp.runCommand "initramfs.cpio.gz"
             {
               nativeBuildInputs = [
@@ -72,7 +105,7 @@
             '';
         in
         {
-          inherit guest-runtime initramfs;
+          inherit guest-runtime guest-kernel initramfs;
         }
       );
     };

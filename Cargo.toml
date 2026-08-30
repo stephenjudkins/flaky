@@ -1,6 +1,7 @@
 [workspace]
-members = ["host", "guest-runtime", "apis"]
+members = ["host", "guest-runtime", "apis", "nar-to-erofs", "nix-cache", "nix-drv"]
 resolver = "3"
+
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +25,7 @@ nix = { version = "0.31", features = ["fs", "mount", "reboot"] }
 oci-spec = "0.10"
 pid1 = "0.1"
 postcard = { version = "1", default-features = false, features = ["use-std", "alloc"] }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
 tarpc = { version = "0.36", features = ["serde-transport"] }
@@ -32,4 +33,15 @@ tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
 tokio-serde = { version = "0.9", default-features = false }
 tokio-vsock = "0.7"
 apis = { path = "apis" }
+base64 = "0.22"
+nix-drv = { path = "nix-drv" }
+nar-to-erofs = { path = "nar-to-erofs" }
+nix-cache = { path = "nix-cache" }
 zstd = "0.13"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "xz", "zstd"] }
+narinfo = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio-util = { version = "0.7", features = ["io"] }

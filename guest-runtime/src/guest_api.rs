@@ -26,6 +26,10 @@ impl GuestApi for GuestApiServer {
         format!("hello {x}")
     }
 
+    async fn build(self, _: context::Context, request: apis::BuildRequest) -> apis::BuildResult {
+        crate::builder::run_build(request).await
+    }
+
     async fn shutdown(self, _: context::Context) -> String {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         "shutting down".to_string()

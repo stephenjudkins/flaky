@@ -4,11 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+erofs-builder.workspace = true
 futures.workspace = true
+libc.workspace = true
+nix-drv.workspace = true
+nar-to-erofs.workspace = true
 nix.workspace = true
 pid1.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tarpc.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
 tokio-vsock.workspace = true
 apis.workspace = true
