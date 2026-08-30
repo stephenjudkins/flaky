@@ -121,9 +121,38 @@ async fn plan<'a>(
         std::fs::create_dir_all(opts.cache_dir.join(d))?;
     }
 
-    // images carried over from earlier sessions
-    // look up narinfo for every fetchable path: the References lines drive
-    // input-set computation even when the image is already cached
+    // fast path: when every output of the root drv already has a local
+    // image, the build goal is already realized — no lookups or VM builds
+    // can be needed (delete an output image in .cache/erofs to force a
+    // rebuild).
+    let mut images: BTreeMap<String, PathBuf> = BTreeMap::new();
+    if drvs[root]
+        .outputs
+        .values()
+        .all(|o| image_path(opts, &o.path).exists())
+    {
+        for o in drvs[root].outputs.values() {
+            images.insert(o.path.clone(), image_path(opts, &o.path));
+        }
+        println!("build: root outputs already cached locally");
+        return Ok(Ctx {
+            drvs,
+            closure,
+            opts,
+            cache,
+            plan: Plan {
+                hits: BTreeMap::new(),
+                miss_drv: BTreeMap::new(),
+                to_build: Vec::new(),
+            },
+            images,
+        });
+    }
+
+    // local images are preloaded before lookup so builds can reuse them;
+    // narinfo is still fetched for every path (including cached ones) because
+    // the References lines keep input sets exact — the superset fallback
+    // via drv inputs would pull in unneeded build-time deps
     let to_lookup: Vec<&String> = closure.store_paths.iter().collect();
     let mut images: BTreeMap<String, PathBuf> = BTreeMap::new();
     for p in &to_lookup {
@@ -151,6 +180,18 @@ async fn plan<'a>(
                 let dp = producing_drv(closure, drvs, &p)
                     .ok_or_else(|| anyhow!("no drv in closure produces {p}"))?;
                 miss_drv.insert(p.clone(), dp.clone());
+                // outputs realized by an earlier run: keep the image, skip the build
+                if drvs[&dp]
+                    .outputs
+                    .values()
+                    .all(|o| images.contains_key(&o.path))
+                {
+                    println!(
+                        "[cache] {}: output image already present",
+                        nix_drv::basename(&p)
+                    );
+                    continue;
+                }
                 if drvs[&dp].builder != "builtin:fetchurl" {
                     println!("[miss] {}: will build {}", nix_drv::basename(&p), dp);
                     to_build.insert(dp);
