@@ -8,25 +8,8 @@ mod host_api;
 mod image_fs;
 mod orchestrator;
 mod rpc;
-mod session;
 mod vm;
 mod vsock_device;
-use host_api::HostApiServer;
-use vsock_device::{VsockHost, VsockParam};
-
-async fn run_session(vsock_host: &VsockHost) -> anyhow::Result<()> {
-    let guest_api_stream =
-        tokio::net::UnixStream::from_std(vsock_host.accept(apis::GUEST_API_PORT).await?)?;
-    let host_api_stream =
-        tokio::net::UnixStream::from_std(vsock_host.accept(apis::HOST_API_PORT).await?)?;
-    let mut conn = rpc::GuestApiConnection::new(guest_api_stream);
-    let host_api = rpc::serve_host_api(host_api_stream, HostApiServer);
-    tokio::pin!(host_api);
-    tokio::select! {
-        r = session::run_session(&mut conn) => r,
-        _ = &mut host_api => anyhow::bail!("host api server terminated"),
-    }
-}
 
 #[derive(Parser)]
 struct Cli {
@@ -36,8 +19,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Old hello/shutdown demo flow
-    Demo,
     /// Build a derivation from `nix derivation show -r` JSON
     Build {
         drv_json: PathBuf,
@@ -65,63 +46,14 @@ fn main() -> Result<()> {
     )
     .init();
     let cli = Cli::parse();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main(cli.cmd))
+}
 
-    match cli.cmd {
-        Cmd::Demo => {
-            let hv = alioth::hv::Hvf {};
-            let vm = alioth::vm::Machine::new(
-                &hv,
-                alioth::board::BoardConfig {
-                    mem: alioth::mem::MemConfig {
-                        size: 512 << 20,
-                        backend: alioth::mem::MemBackend::Anonymous,
-                        ..Default::default()
-                    },
-                    cpu: alioth::board::CpuConfig {
-                        count: 1,
-                        ..Default::default()
-                    },
-                    coco: None,
-                },
-            )?;
-            vm.add_pl011()?;
-            vm.add_pl031();
-            vm.add_virtio_dev(
-                "virtio-blk",
-                alioth::virtio::dev::blk::BlkFileParam {
-                    path: PathBuf::from("guest/nixdisk.erofs").into(),
-                    readonly: true,
-                    api: alioth::virtio::worker::WorkerApi::Mio,
-                },
-            )?;
-            vm.add_virtio_dev(
-                "virtio-rng",
-                alioth::virtio::dev::entropy::EntropyParam::default(),
-            )?;
-            let (vsock_param, vsock_host) = VsockParam::new(3);
-            vm.add_virtio_dev("virtio-vsock", vsock_param)?;
-
-            vm.add_payload(alioth::loader::Payload {
-                executable: Some(alioth::loader::Executable::Linux(
-                    PathBuf::from("guest/vmlinux.bin").into(),
-                )),
-                cmdline: Some(std::ffi::CString::new(
-                    "console=ttyAMA0 rdinit=/init quiet",
-                )?),
-                initramfs: Some(PathBuf::from("guest/initramfs.cpio.gz").into()),
-                firmware: None,
-            });
-
-            vm.boot()?;
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(run_session(&vsock_host))?;
-
-            vm.wait()?;
-            Ok(())
-        }
+async fn async_main(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Build {
             drv_json,
             cache,
@@ -131,8 +63,9 @@ fn main() -> Result<()> {
             cache_url: cache,
             cache_dir,
         })
+        .await
         .map(|out_path| println!("built: {out_path}")),
-        Cmd::NixVersion => nix_version(),
+        Cmd::NixVersion => nix_version().await,
         Cmd::NixEval { expr, file } => {
             let expr = match (expr, file) {
                 (Some(e), None) => e,
@@ -140,14 +73,14 @@ fn main() -> Result<()> {
                 (None, None) => anyhow::bail!("pass exactly one of --expr or --file"),
                 (Some(_), Some(_)) => anyhow::bail!("pass exactly one of --expr or --file"),
             };
-            nix_eval(expr)
+            nix_eval(expr).await
         }
     }
 }
 
 const NIX_CLOSURE_IMAGE: &str = "nix-closure.erofs";
 
-fn boot_nix_vm() -> Result<(vm::Vm, String)> {
+async fn boot_nix_vm() -> Result<(vm::Vm, String)> {
     let root = std::fs::read_to_string("guest/nix-closure/root")?
         .trim()
         .to_string();
@@ -163,18 +96,37 @@ fn boot_nix_vm() -> Result<(vm::Vm, String)> {
     Ok((vm, root))
 }
 
-fn nix_version() -> Result<()> {
-    let (vm, root) = boot_nix_vm()?;
-    let version = vm.nix_version(NIX_CLOSURE_IMAGE.to_string(), root)?;
-    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60));
+async fn nix_version() -> Result<()> {
+    let (vm, root) = boot_nix_vm().await?;
+    let version = vm
+        .guest_rpc(|c| async move {
+            c.nix_version(
+                apis::tarpc::context::current(),
+                NIX_CLOSURE_IMAGE.to_string(),
+                root,
+            )
+            .await
+        })
+        .await?;
+    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60)).await;
     println!("{version}");
     Ok(())
 }
 
-fn nix_eval(expr: String) -> Result<()> {
-    let (vm, root) = boot_nix_vm()?;
-    let result = vm.nix_eval(NIX_CLOSURE_IMAGE.to_string(), root, expr)?;
-    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60));
+async fn nix_eval(expr: String) -> Result<()> {
+    let (vm, root) = boot_nix_vm().await?;
+    let result = vm
+        .guest_rpc(|c| async move {
+            c.nix_eval(
+                apis::tarpc::context::current(),
+                NIX_CLOSURE_IMAGE.to_string(),
+                root,
+                expr,
+            )
+            .await
+        })
+        .await?;
+    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60)).await;
     println!("{result}");
     Ok(())
 }

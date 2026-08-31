@@ -1,6 +1,6 @@
 use std::ffi::CString;
+use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::time::Duration;
 
 use alioth::board::{BoardConfig, CpuConfig};
@@ -13,9 +13,7 @@ use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 use anyhow::Context as _;
 
-use crate::host_api::HostApiServer;
 use crate::image_fs::{ImageFile, ImageFilesParam};
-use crate::rpc::{self, GuestApiConnection};
 use crate::vsock_device::{VsockHost, VsockParam};
 
 pub struct BlkDev {
@@ -100,100 +98,49 @@ impl Vm {
     }
 
     /// Accepts the guest's vsock connections, serves the host API
-    /// (logging), and performs one `build` RPC against the guest.
-    pub fn run_build(&self, request: apis::BuildRequest) -> anyhow::Result<apis::BuildResult> {
-        self.with_guest_api(|conn| {
-            Box::pin(async move {
-                conn.drive(|c| async move {
-                    c.build(apis::tarpc::context::current(), request)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                })
-                .await
-            })
-        })
-    }
-
-    /// Same as `run_build`, but performs a `nix_version` RPC: the guest
-    /// mounts the named closure image, binds it into /nix/store, and runs
-    /// `nix --version` from `nix_root`.
-    pub fn nix_version(&self, image: String, nix_root: String) -> anyhow::Result<String> {
-        self.with_guest_api(|conn| {
-            Box::pin(async move {
-                conn.drive(|c| async move {
-                    c.nix_version(apis::tarpc::context::current(), image, nix_root)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                })
-                .await
-            })
-        })
-    }
-
-    pub fn nix_eval(
-        &self,
-        image: String,
-        nix_root: String,
-        expr: String,
-    ) -> anyhow::Result<String> {
-        self.with_guest_api(|conn| {
-            Box::pin(async move {
-                conn.drive(|c| async move {
-                    c.nix_eval(apis::tarpc::context::current(), image, nix_root, expr)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                })
-                .await
-            })
-        })
-    }
-
-    fn with_guest_api<T, F>(&self, f: F) -> anyhow::Result<T>
+    /// (logging), and performs one RPC against the guest. `f` receives
+    /// the tarpc client and returns the in-flight request future.
+    pub async fn guest_rpc<T, F, Fut>(&self, f: F) -> anyhow::Result<T>
     where
-        F: for<'a> FnOnce(
-            &'a mut crate::rpc::GuestApiConnection,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + 'a>>,
+        F: FnOnce(crate::rpc::GuestApiClient) -> Fut,
+        Fut: Future<Output = std::result::Result<T, apis::tarpc::client::RpcError>>,
     {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async {
-            let guest_api_stream = tokio::net::UnixStream::from_std(
-                tokio::time::timeout(
-                    GUEST_CONNECT_TIMEOUT,
-                    self.vsock_host.accept(apis::GUEST_API_PORT),
-                )
-                .await
-                .context("timed out waiting for guest api connection")??,
-            )?;
-            let host_api_stream = tokio::net::UnixStream::from_std(
-                tokio::time::timeout(
-                    GUEST_CONNECT_TIMEOUT,
-                    self.vsock_host.accept(apis::HOST_API_PORT),
-                )
-                .await
-                .context("timed out waiting for host api connection")??,
-            )?;
-            let mut conn = crate::rpc::GuestApiConnection::new(guest_api_stream);
-            let host_api =
-                crate::rpc::serve_host_api(host_api_stream, crate::host_api::HostApiServer);
-            tokio::pin!(host_api);
-            let result = tokio::select! {
-                r = f(&mut conn) => r,
-                _ = &mut host_api => anyhow::bail!("host api server terminated"),
-            };
-            // always ask the guest to power off so vm.wait() completes
-            let _ = tokio::time::timeout(
-                SHUTDOWN_TIMEOUT,
-                conn.drive(|c| async move {
-                    c.shutdown(apis::tarpc::context::current())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                }),
+        let guest_api_stream = tokio::net::UnixStream::from_std(
+            tokio::time::timeout(
+                GUEST_CONNECT_TIMEOUT,
+                self.vsock_host.accept(apis::GUEST_API_PORT),
             )
-            .await;
-            result
-        })
+            .await
+            .context("timed out waiting for guest api connection")??,
+        )?;
+        let host_api_stream = tokio::net::UnixStream::from_std(
+            tokio::time::timeout(
+                GUEST_CONNECT_TIMEOUT,
+                self.vsock_host.accept(apis::HOST_API_PORT),
+            )
+            .await
+            .context("timed out waiting for host api connection")??,
+        )?;
+        let mut conn = crate::rpc::GuestApiConnection::new(guest_api_stream);
+        let host_api = crate::rpc::serve_host_api(host_api_stream, crate::host_api::HostApiServer);
+        tokio::pin!(host_api);
+        let result = tokio::select! {
+            r = conn.drive(|c| async move {
+                f(c).await.map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+            }) => r,
+            _ = &mut host_api => anyhow::bail!("host api server terminated"),
+        };
+        // always ask the guest to power off so vm.wait() completes
+        let _ = tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            conn.drive(|c| async move {
+                c.shutdown(apis::tarpc::context::current())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+            }),
+        )
+        .await;
+        result
     }
 
     pub fn wait(self) -> anyhow::Result<()> {

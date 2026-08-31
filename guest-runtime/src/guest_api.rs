@@ -22,10 +22,6 @@ impl GuestApiServer {
 }
 
 impl GuestApi for GuestApiServer {
-    async fn hello(self, _: context::Context, x: String) -> String {
-        format!("hello {x}")
-    }
-
     async fn build(self, _: context::Context, request: apis::BuildRequest) -> apis::BuildResult {
         crate::builder::run_build(request).await
     }

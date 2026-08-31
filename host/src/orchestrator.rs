@@ -60,7 +60,7 @@ struct Ctx<'a> {
     images: BTreeMap<String, PathBuf>,
 }
 
-pub fn run(opts: BuildOpts) -> anyhow::Result<String> {
+pub async fn run(opts: BuildOpts) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(&opts.drv_json)
         .with_context(|| format!("reading {}", opts.drv_json.display()))?;
     let drvs = nix_drv::parse(&text).context("parsing derivation json")?;
@@ -73,38 +73,31 @@ pub fn run(opts: BuildOpts) -> anyhow::Result<String> {
         closure.store_paths.len()
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let mut ctx = rt.block_on(async {
-        let mut ctx = plan(&drvs, &closure, &root, &opts).await?;
-        // prefetch images for the union of all builds' input sets
-        let mut needed: BTreeSet<String> = BTreeSet::new();
-        for dp in ctx.plan.to_build.clone() {
-            needed.extend(ctx.input_set(&dp)?);
-        }
-        // ensure root outputs materialize even when the whole closure is cached
-        needed.extend(drvs[&root].outputs.values().map(|o| o.path.clone()));
-        let building: BTreeSet<String> = ctx.plan.to_build.clone().into_iter().collect();
-        let fetchable: Vec<String> = needed
-            .into_iter()
-            .filter(|p| {
-                if ctx.images.contains_key(&*p) {
-                    return false;
-                }
-                match ctx.plan.miss_drv.get(&*p) {
-                    Some(dp) => !building.contains(dp),
-                    None => true,
-                }
-            })
-            .collect();
-        println!("build: fetching {} input images", fetchable.len());
-        fetch_images(&mut ctx, fetchable).await?;
-        anyhow::Ok(ctx)
-    })?;
-    // VM builds run outside the async runtime: Vm::run_build spins up its own
+    let mut ctx = plan(&drvs, &closure, &root, &opts).await?;
+    // prefetch images for the union of all builds' input sets
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    for dp in ctx.plan.to_build.clone() {
+        needed.extend(ctx.input_set(&dp)?);
+    }
+    // ensure root outputs materialize even when the whole closure is cached
+    needed.extend(drvs[&root].outputs.values().map(|o| o.path.clone()));
+    let building: BTreeSet<String> = ctx.plan.to_build.clone().into_iter().collect();
+    let fetchable: Vec<String> = needed
+        .into_iter()
+        .filter(|p| {
+            if ctx.images.contains_key(&*p) {
+                return false;
+            }
+            match ctx.plan.miss_drv.get(&*p) {
+                Some(dp) => !building.contains(dp),
+                None => true,
+            }
+        })
+        .collect();
+    println!("build: fetching {} input images", fetchable.len());
+    fetch_images(&mut ctx, fetchable).await?;
     for drv_path in ctx.plan.to_build.clone() {
-        build_one(&mut ctx, &drv_path)?;
+        build_one(&mut ctx, &drv_path).await?;
     }
     root_out.ok_or_else(|| anyhow!("root derivation has no outputs"))
 }
@@ -503,7 +496,7 @@ fn prep_output_device(path: &Path, output_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
+async fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
     let drv = ctx.drvs[drv_path].clone();
     let outputs: Vec<_> = drv.outputs.iter().collect();
     println!(
@@ -582,8 +575,11 @@ fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
         blk,
     })
     .context("booting build vm")?;
-    let result: BuildResult = vm.run_build(request).context("running build in vm")?;
-    reap_vm(vm, Duration::from_secs(60));
+    let result: BuildResult = vm
+        .guest_rpc(|c| async move { c.build(apis::tarpc::context::current(), request).await })
+        .await
+        .context("running build in vm")?;
+    reap_vm(vm, Duration::from_secs(60)).await;
 
     if !result.success {
         bail!(
@@ -618,17 +614,16 @@ fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn reap_vm(vm: Vm, timeout: Duration) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(vm.wait());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(r) => {
+pub(crate) async fn reap_vm(vm: Vm, timeout: Duration) {
+    let result =
+        tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || vm.wait())).await;
+    match result {
+        Ok(Ok(r)) => {
             if let Err(e) = r {
                 eprintln!("warning: vm exited with error: {e:#}");
             }
         }
+        Ok(Err(e)) => eprintln!("warning: vm wait task failed: {e:#}"),
         Err(_) => eprintln!(
             "warning: vm did not power off within {timeout:?}; continuing with vm still running"
         ),
