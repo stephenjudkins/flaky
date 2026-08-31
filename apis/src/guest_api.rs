@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub trait GuestApi {
     async fn hello(x: String) -> String;
     async fn build(request: BuildRequest) -> BuildResult;
+    async fn nix_version(image: String, nix_root: String) -> String;
+    async fn nix_eval(image: String, nix_root: String, expr: String) -> String;
     async fn shutdown() -> String;
 }
 

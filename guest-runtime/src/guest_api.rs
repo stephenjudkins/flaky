@@ -30,6 +30,26 @@ impl GuestApi for GuestApiServer {
         crate::builder::run_build(request).await
     }
 
+    async fn nix_version(self, _: context::Context, image: String, nix_root: String) -> String {
+        match crate::runner::nix_version(image, nix_root).await {
+            Ok(v) => v,
+            Err(e) => format!("guest: nix_version error: {e}"),
+        }
+    }
+
+    async fn nix_eval(
+        self,
+        _: context::Context,
+        image: String,
+        nix_root: String,
+        expr: String,
+    ) -> String {
+        match crate::runner::nix_eval(image, nix_root, expr).await {
+            Ok(v) => v,
+            Err(e) => format!("guest: nix_eval error: {e}"),
+        }
+    }
+
     async fn shutdown(self, _: context::Context) -> String {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         "shutting down".to_string()

@@ -6,6 +6,7 @@ use nix::mount::MsFlags;
 mod builder;
 mod guest_api;
 mod rpc;
+mod runner;
 mod session;
 
 fn setup_console() {

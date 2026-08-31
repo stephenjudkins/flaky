@@ -618,7 +618,7 @@ fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reap_vm(vm: Vm, timeout: Duration) {
+pub(crate) fn reap_vm(vm: Vm, timeout: Duration) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(vm.wait());

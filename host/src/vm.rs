@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use alioth::board::{BoardConfig, CpuConfig};
@@ -101,7 +102,58 @@ impl Vm {
     /// Accepts the guest's vsock connections, serves the host API
     /// (logging), and performs one `build` RPC against the guest.
     pub fn run_build(&self, request: apis::BuildRequest) -> anyhow::Result<apis::BuildResult> {
-        use apis::tarpc::context;
+        self.with_guest_api(|conn| {
+            Box::pin(async move {
+                conn.drive(|c| async move {
+                    c.build(apis::tarpc::context::current(), request)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+                })
+                .await
+            })
+        })
+    }
+
+    /// Same as `run_build`, but performs a `nix_version` RPC: the guest
+    /// mounts the named closure image, binds it into /nix/store, and runs
+    /// `nix --version` from `nix_root`.
+    pub fn nix_version(&self, image: String, nix_root: String) -> anyhow::Result<String> {
+        self.with_guest_api(|conn| {
+            Box::pin(async move {
+                conn.drive(|c| async move {
+                    c.nix_version(apis::tarpc::context::current(), image, nix_root)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+                })
+                .await
+            })
+        })
+    }
+
+    pub fn nix_eval(
+        &self,
+        image: String,
+        nix_root: String,
+        expr: String,
+    ) -> anyhow::Result<String> {
+        self.with_guest_api(|conn| {
+            Box::pin(async move {
+                conn.drive(|c| async move {
+                    c.nix_eval(apis::tarpc::context::current(), image, nix_root, expr)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+                })
+                .await
+            })
+        })
+    }
+
+    fn with_guest_api<T, F>(&self, f: F) -> anyhow::Result<T>
+    where
+        F: for<'a> FnOnce(
+            &'a mut crate::rpc::GuestApiConnection,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + 'a>>,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -122,22 +174,19 @@ impl Vm {
                 .await
                 .context("timed out waiting for host api connection")??,
             )?;
-            let mut conn = GuestApiConnection::new(guest_api_stream);
-            let host_api = rpc::serve_host_api(host_api_stream, HostApiServer);
+            let mut conn = crate::rpc::GuestApiConnection::new(guest_api_stream);
+            let host_api =
+                crate::rpc::serve_host_api(host_api_stream, crate::host_api::HostApiServer);
             tokio::pin!(host_api);
             let result = tokio::select! {
-                r = conn.drive(|c| async move {
-                    c.build(context::current(), request)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-                }) => r,
+                r = f(&mut conn) => r,
                 _ = &mut host_api => anyhow::bail!("host api server terminated"),
             };
             // always ask the guest to power off so vm.wait() completes
             let _ = tokio::time::timeout(
                 SHUTDOWN_TIMEOUT,
                 conn.drive(|c| async move {
-                    c.shutdown(context::current())
+                    c.shutdown(apis::tarpc::context::current())
                         .await
                         .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
                 }),

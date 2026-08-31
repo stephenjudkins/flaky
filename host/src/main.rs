@@ -46,6 +46,17 @@ enum Cmd {
         #[arg(long, default_value = ".cache")]
         cache_dir: PathBuf,
     },
+    /// Run `nix --version` in the guest
+    NixVersion,
+    /// Evaluate a nix expression in the guest
+    NixEval {
+        /// Expression text, e.g. '1 + 1'
+        #[arg(long)]
+        expr: Option<String>,
+        /// Read the expression from this file instead of --expr
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -121,5 +132,49 @@ fn main() -> Result<()> {
             cache_dir,
         })
         .map(|out_path| println!("built: {out_path}")),
+        Cmd::NixVersion => nix_version(),
+        Cmd::NixEval { expr, file } => {
+            let expr = match (expr, file) {
+                (Some(e), None) => e,
+                (None, Some(f)) => std::fs::read_to_string(f)?,
+                (None, None) => anyhow::bail!("pass exactly one of --expr or --file"),
+                (Some(_), Some(_)) => anyhow::bail!("pass exactly one of --expr or --file"),
+            };
+            nix_eval(expr)
+        }
     }
+}
+
+const NIX_CLOSURE_IMAGE: &str = "nix-closure.erofs";
+
+fn boot_nix_vm() -> Result<(vm::Vm, String)> {
+    let root = std::fs::read_to_string("guest/nix-closure/root")?
+        .trim()
+        .to_string();
+    let vm = vm::Vm::boot(vm::VmSpec {
+        mem_mib: 1024,
+        cpus: 1,
+        images: vec![image_fs::ImageFile {
+            name: NIX_CLOSURE_IMAGE.to_string(),
+            path: PathBuf::from(format!("guest/nix-closure/{NIX_CLOSURE_IMAGE}")),
+        }],
+        blk: vec![],
+    })?;
+    Ok((vm, root))
+}
+
+fn nix_version() -> Result<()> {
+    let (vm, root) = boot_nix_vm()?;
+    let version = vm.nix_version(NIX_CLOSURE_IMAGE.to_string(), root)?;
+    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60));
+    println!("{version}");
+    Ok(())
+}
+
+fn nix_eval(expr: String) -> Result<()> {
+    let (vm, root) = boot_nix_vm()?;
+    let result = vm.nix_eval(NIX_CLOSURE_IMAGE.to_string(), root, expr)?;
+    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60));
+    println!("{result}");
+    Ok(())
 }

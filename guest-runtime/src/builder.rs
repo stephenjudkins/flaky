@@ -57,11 +57,11 @@ fn discover_devices() -> std::io::Result<Devices> {
     Ok(devs)
 }
 
-fn mount_err<T>(r: nix::Result<T>, what: &str) -> std::io::Result<T> {
+pub(crate) fn mount_err<T>(r: nix::Result<T>, what: &str) -> std::io::Result<T> {
     r.map_err(|e| std::io::Error::other(format!("{what}: {e}")))
 }
 
-fn mount_fs(src: &Path, dst: &Path, fstype: &str, ro: bool) -> std::io::Result<()> {
+pub(crate) fn mount_fs(src: &Path, dst: &Path, fstype: &str, ro: bool) -> std::io::Result<()> {
     let flags = if ro {
         MsFlags::MS_RDONLY
     } else {
@@ -79,7 +79,7 @@ fn mount_fs(src: &Path, dst: &Path, fstype: &str, ro: bool) -> std::io::Result<(
     )
 }
 
-fn mount_image_files() -> std::io::Result<()> {
+pub(crate) fn mount_image_files() -> std::io::Result<()> {
     fs::create_dir_all(IMAGE_DIR)?;
     fs::set_permissions(IMAGE_DIR, fs::Permissions::from_mode(0o700))?;
     mount_err(
@@ -108,7 +108,7 @@ fn mount_bind(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Binds `<image_root>/<basename of store_path>` over `store_path`.
-fn bind_from_image(image_root: &Path, store_path: &str) -> std::io::Result<()> {
+pub(crate) fn bind_from_image(image_root: &Path, store_path: &str) -> std::io::Result<()> {
     let base = nix_drv::basename(store_path);
     let src = image_root.join(base);
     let dst = Path::new(store_path);

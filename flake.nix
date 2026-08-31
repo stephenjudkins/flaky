@@ -212,9 +212,26 @@
               ln -s ${guest-runtime}/bin/guest-runtime $root/init
               (cd "$root" && find . | LC_ALL=C sort | cpio -o -H newc --reproducible | lz4 -l -9 --favor-decSpeed) > $out
             '';
+          nix-closure-image = bp.runCommand "nix-closure-image"
+            {
+              nativeBuildInputs = [ bp.erofs-utils ];
+              closure = bp.closureInfo { rootPaths = [ pkgs.nix pkgs.nix.man ]; };
+            }
+            ''
+              root=$(mktemp -d)
+              while read -r p; do
+                cp -R "$p" "$root/"
+              done < "$closure/store-paths"
+              mkdir -p $out
+              mkfs.erofs -T1 --all-root \
+                -U 00000000-0000-0000-0000-000000000000 \
+                -L nix-closure \
+                $out/nix-closure.erofs "$root"
+              echo ${pkgs.nix} > $out/root
+            '';
         in
         {
-          inherit guest-runtime guest-kernel initramfs;
+          inherit guest-runtime guest-kernel initramfs nix-closure-image;
         }
       );
     };
