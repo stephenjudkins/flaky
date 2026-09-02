@@ -471,15 +471,41 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + AsyncSeek + Unpin + Send,
 {
-    let opts = CreateOptions {
+    let mut writer = image_writer(sink, "").await?;
+    write_nar(NarDecoder::new(src), &mut writer, prefix).await?;
+    let sink = writer.finish().await?;
+    Ok(sink.into_inner())
+}
+
+/// Reproducible (epoch) `CreateOptions` for the given volume name — the
+/// conventions every image produced by flaky follows.
+pub fn image_writer_opts(volume: &str) -> CreateOptions {
+    CreateOptions {
         block_size: DEFAULT_BLOCK_SIZE,
         build_time: 0,
         build_time_nsec: 0,
+        volume_name: volume.to_string(),
         ..Default::default()
-    };
-    let mut writer = Writer::new(sink, opts).await?;
-    write_nar(NarDecoder::new(src), &mut writer, prefix).await?;
-    Ok(writer.finish().await?)
+    }
+}
+
+/// A `Writer` over `sink` counting bytes written, per `image_writer_opts`.
+pub async fn image_writer<W>(sink: W, volume: &str) -> Result<Writer<CountingSink<W>>>
+where
+    W: AsyncWrite + AsyncSeek + Unpin + Send,
+{
+    Ok(Writer::new(CountingSink::new(sink), image_writer_opts(volume)).await?)
+}
+
+/// Finishes `writer`, returning the unwrapped sink and the image size in
+/// bytes (the high-water mark, not the patched-back stream position).
+pub async fn finish_image<W>(writer: Writer<CountingSink<W>>) -> Result<(W, u64)>
+where
+    W: AsyncWrite + AsyncSeek + Unpin + Send,
+{
+    let sink = writer.finish().await?;
+    let size = sink.count();
+    Ok((sink.into_inner(), size))
 }
 
 /// Sink wrapper that tracks the high-water mark of the underlying write

@@ -84,15 +84,15 @@ async fn boot_nix_vm() -> Result<(vm::Vm, String)> {
     let root = std::fs::read_to_string("guest/nix-closure/root")?
         .trim()
         .to_string();
-    let vm = vm::Vm::boot(vm::VmSpec {
-        mem_mib: 1024,
-        cpus: 1,
-        images: vec![image_fs::ImageFile {
+    let vm = vm::Vm::boot(vm::VmSpec::guest(
+        1024,
+        1,
+        vec![image_fs::ImageFile {
             name: NIX_CLOSURE_IMAGE.to_string(),
             path: PathBuf::from(format!("guest/nix-closure/{NIX_CLOSURE_IMAGE}")),
         }],
-        blk: vec![],
-    })?;
+        vec![],
+    ))?;
     Ok((vm, root))
 }
 
@@ -107,8 +107,9 @@ async fn nix_version() -> Result<()> {
             )
             .await
         })
-        .await?;
-    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60)).await;
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    vm.reap(std::time::Duration::from_secs(60)).await;
     println!("{version}");
     Ok(())
 }
@@ -125,8 +126,9 @@ async fn nix_eval(expr: String) -> Result<()> {
             )
             .await
         })
-        .await?;
-    orchestrator::reap_vm(vm, std::time::Duration::from_secs(60)).await;
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    vm.reap(std::time::Duration::from_secs(60)).await;
     println!("{result}");
     Ok(())
 }

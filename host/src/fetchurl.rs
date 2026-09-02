@@ -6,7 +6,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
-use erofs_builder::{CreateOptions, DEFAULT_BLOCK_SIZE, Writer};
 use futures::TryStreamExt;
 use nix_drv::Derivation;
 use sha2::{Digest, Sha256};
@@ -262,18 +261,7 @@ pub async fn realize_to_image(
     );
 
     let file = tokio::fs::File::create(dest).await?;
-    let sink = nar_to_erofs::CountingSink::new(file);
-    let mut writer = Writer::new(
-        sink,
-        CreateOptions {
-            block_size: DEFAULT_BLOCK_SIZE,
-            build_time: 0,
-            build_time_nsec: 0,
-            volume_name: nix_drv::hash_part(out_path)[..16].to_string(),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let mut writer = nar_to_erofs::image_writer(file, &apis::volume_id(out_path)).await?;
 
     let reader = NarOfFile {
         file: tokio::fs::File::open(&tmp).await?,
@@ -291,9 +279,7 @@ pub async fn realize_to_image(
     )
     .await
     .map_err(|e| anyhow!("writing fetchurl nar: {e}"))?;
-    let sink = writer.finish().await?;
-    let image_size = sink.count();
-    let file = sink.into_inner();
+    let (file, image_size) = nar_to_erofs::finish_image(writer).await?;
     file.set_len(image_size).await?;
     file.sync_all().await?;
     let _ = std::fs::remove_file(&tmp);

@@ -26,6 +26,23 @@ pub struct VmSpec {
     pub cpus: u16,
     pub images: Vec<ImageFile>,
     pub blk: Vec<BlkDev>,
+    pub kernel: PathBuf,
+    pub initramfs: PathBuf,
+    pub cmdline: String,
+}
+
+impl VmSpec {
+    pub fn guest(mem_mib: u64, cpus: u16, images: Vec<ImageFile>, blk: Vec<BlkDev>) -> Self {
+        VmSpec {
+            mem_mib,
+            cpus,
+            images,
+            blk,
+            kernel: PathBuf::from("guest/vmlinux.bin"),
+            initramfs: PathBuf::from("guest/initramfs.cpio.gz"),
+            cmdline: "console=ttyAMA0 rdinit=/init".to_string(),
+        }
+    }
 }
 
 pub struct Vm {
@@ -38,8 +55,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Vm {
     pub fn boot(spec: VmSpec) -> anyhow::Result<Vm> {
-        let cmdline = String::from("console=ttyAMA0 rdinit=/init");
-        let kernel = PathBuf::from("guest/vmlinux.bin");
         let hv = Hvf {};
         let vm = Machine::new(
             &hv,
@@ -83,9 +98,9 @@ impl Vm {
         vm.add_virtio_dev("virtio-vsock", vsock_param)?;
 
         vm.add_payload(Payload {
-            executable: Some(Executable::Linux(kernel.into())),
-            cmdline: Some(CString::new(cmdline).unwrap()),
-            initramfs: Some(PathBuf::from("guest/initramfs.cpio.gz").into()),
+            executable: Some(Executable::Linux(spec.kernel.into())),
+            cmdline: Some(CString::new(spec.cmdline).unwrap()),
+            initramfs: Some(spec.initramfs.into()),
             firmware: None,
         });
 
@@ -146,5 +161,24 @@ impl Vm {
     pub fn wait(self) -> anyhow::Result<()> {
         self.machine.wait()?;
         Ok(())
+    }
+
+    /// Waits for the VM to power off, warning (not failing) on timeout or
+    /// error. Callers use this after `guest_rpc`, which already asked the
+    /// guest to shut down.
+    pub async fn reap(self, timeout: Duration) {
+        let result =
+            tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || self.wait())).await;
+        match result {
+            Ok(Ok(r)) => {
+                if let Err(e) = r {
+                    eprintln!("warning: vm exited with error: {e:#}");
+                }
+            }
+            Ok(Err(e)) => eprintln!("warning: vm wait task failed: {e:#}"),
+            Err(_) => eprintln!(
+                "warning: vm did not power off within {timeout:?}; continuing with vm still running"
+            ),
+        }
     }
 }

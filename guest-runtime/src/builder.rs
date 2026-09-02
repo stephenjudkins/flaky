@@ -7,14 +7,13 @@ use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
 use apis::{BuildRequest, BuildResult, OutputImage};
-use erofs_builder::{CreateOptions, DEFAULT_BLOCK_SIZE, InodeMeta, Writer};
+use erofs_builder::{InodeMeta, Writer};
 use nix::mount::{MsFlags, mount};
 use nix_drv::{generate_attrs_sh, structured_env};
 use tokio::io::AsyncRead;
 
 const IMAGE_DIR: &str = "/run/flaky-images";
 const IMAGE_TAG: &str = "flaky-images";
-const OUTPUT_LABEL_OFFSET: u64 = 65536;
 
 struct Devices {
     outputs: BTreeMap<String, PathBuf>,
@@ -45,9 +44,9 @@ fn discover_devices() -> std::io::Result<Devices> {
     names.sort();
     for name in names {
         let path = PathBuf::from("/dev").join(&name);
-        let label = read_at(&path, OUTPUT_LABEL_OFFSET, 64)?;
+        let label = read_at(&path, apis::OUTPUT_LABEL_OFFSET, 64)?;
         let label = cstr(&label);
-        if let Some(out) = label.strip_prefix("flaky-out:") {
+        if let Some(out) = label.strip_prefix(apis::OUTPUT_LABEL_PREFIX) {
             println!("guest: {name}: output device for output {out}");
             devs.outputs.insert(out.to_string(), path);
         } else {
@@ -92,6 +91,36 @@ pub(crate) fn mount_image_files() -> std::io::Result<()> {
         ),
         &format!("mount virtiofs {IMAGE_TAG} on {IMAGE_DIR}"),
     )
+}
+
+/// Best-effort base mounts shared by every guest task: sysfs, proc, and
+/// the /dev/fd|stdin|stdout|stderr symlinks.
+pub(crate) fn mount_base() -> std::io::Result<()> {
+    let _ = mount_err(
+        mount(
+            None::<&str>,
+            "/sys",
+            Some("sysfs"),
+            MsFlags::empty(),
+            None::<&str>,
+        ),
+        "mount sysfs",
+    );
+    let _ = mount_err(
+        mount(
+            None::<&str>,
+            "/proc",
+            Some("proc"),
+            MsFlags::empty(),
+            None::<&str>,
+        ),
+        "mount proc",
+    );
+    let _ = std::os::unix::fs::symlink("/proc/self/fd", "/dev/fd");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/0", "/dev/stdin");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/1", "/dev/stdout");
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
+    Ok(())
 }
 
 fn mount_bind(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -154,8 +183,7 @@ fn setup_mounts(req: &BuildRequest) -> std::io::Result<()> {
         fs::create_dir_all("/inputs")?;
     }
     for (i, inp) in req.inputs.iter().enumerate() {
-        let image =
-            Path::new(IMAGE_DIR).join(format!("{}.erofs", nix_drv::hash_part(&inp.store_path)));
+        let image = Path::new(IMAGE_DIR).join(apis::image_name(&inp.store_path));
         let mnt = Path::new("/inputs").join(&inp.volume_id);
         fs::create_dir_all(&mnt)?;
         mount_fs(&image, &mnt, "erofs", true)?;
@@ -314,21 +342,15 @@ where
 }
 
 async fn pack_output(store_path: &str, dev: &Path) -> std::io::Result<u64> {
-    let volume = &nix_drv::hash_part(store_path)[..16];
+    let volume = apis::volume_id(store_path);
     let file = tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(dev)
         .await?;
-    let sink = nar_to_erofs::CountingSink::new(file);
-    let opts = CreateOptions {
-        block_size: DEFAULT_BLOCK_SIZE,
-        build_time: 0,
-        build_time_nsec: 0,
-        volume_name: volume.to_string(),
-        ..Default::default()
-    };
-    let mut writer = Writer::new(sink, opts).await?;
+    let mut writer = nar_to_erofs::image_writer(file, &volume)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let base = nix_drv::basename(store_path);
     let path = Path::new(store_path);
     let md = fs::symlink_metadata(path)?;
@@ -346,9 +368,9 @@ async fn pack_output(store_path: &str, dev: &Path) -> std::io::Result<u64> {
             .add_file(&format!("{base}/{base}"), meta, md.len(), &mut r)
             .await?;
     }
-    let sink = writer.finish().await?;
-    let size = sink.count();
-    let file = sink.into_inner();
+    let (file, size) = nar_to_erofs::finish_image(writer)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     file.sync_all().await?;
     Ok(size)
 }
@@ -410,30 +432,7 @@ async fn run_build_inner(req: BuildRequest) -> std::io::Result<BuildResult> {
             .map(|o| o.name.clone())
             .collect::<Vec<_>>()
     );
-    let _ = mount_err(
-        mount(
-            None::<&str>,
-            "/sys",
-            Some("sysfs"),
-            MsFlags::empty(),
-            None::<&str>,
-        ),
-        "mount sysfs",
-    );
-    let _ = mount_err(
-        mount(
-            None::<&str>,
-            "/proc",
-            Some("proc"),
-            MsFlags::empty(),
-            None::<&str>,
-        ),
-        "mount proc",
-    );
-    let _ = std::os::unix::fs::symlink("/proc/self/fd", "/dev/fd");
-    let _ = std::os::unix::fs::symlink("/proc/self/fd/0", "/dev/stdin");
-    let _ = std::os::unix::fs::symlink("/proc/self/fd/1", "/dev/stdout");
-    let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
+    mount_base()?;
     mount_image_files()?;
     let devices = discover_devices()?;
     for out in &req.outputs {

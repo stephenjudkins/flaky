@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[tarpc::service]
 pub trait GuestApi {
     async fn build(request: BuildRequest) -> BuildResult;
-    async fn nix_version(image: String, nix_root: String) -> String;
-    async fn nix_eval(image: String, nix_root: String, expr: String) -> String;
+    async fn nix_version(image: String, nix_root: String) -> Result<String, String>;
+    async fn nix_eval(image: String, nix_root: String, expr: String) -> Result<String, String>;
     async fn shutdown() -> String;
 }
 
