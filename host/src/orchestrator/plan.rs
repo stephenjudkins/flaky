@@ -1,11 +1,19 @@
-//! Closure planning: which store paths come from the binary cache, and
-//! which derivations must be built.
+//! Closure planning, lazily: only paths that actually need materializing
+//! (their EROFS image is absent) are looked up, fetched, or built.
+//!
+//! The walk starts at the root drv's outputs. A missing path is looked up
+//! once: an upstream hit is queued for download, a miss marks its producing
+//! drv for building (which enqueues that drv's direct inputs), and a
+//! `builtin:fetchurl` drv is queued for on-demand realization. Paths that
+//! are inputs of a build also expand their references (from narinfo when
+//! available, otherwise the producing drv's inputs as a superset), since
+//! the guest must mount the full reference closure of every direct input.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, anyhow};
-use futures::stream::{self, StreamExt};
-use nix_cache::{Lookup, StorePathHash};
+use nix_cache::{Lookup, NixCache, StorePathHash};
 use nix_drv::{Closure, Derivations};
 
 use super::{Ctx, Plan, image_path, producing_drv};
@@ -17,7 +25,9 @@ pub(super) async fn plan<'a>(
     root: &'a str,
     opts: &'a BuildOpts,
 ) -> anyhow::Result<Ctx<'a>> {
-    let cache = nix_cache::NixCache::new(&opts.cache_url).context("creating cache client")?;
+    let cache = NixCache::new(&opts.cache_url)
+        .context("creating cache client")?
+        .with_disk_cache(opts.cache_dir.join("narinfo"));
 
     for d in ["erofs", "build", "tmp"] {
         std::fs::create_dir_all(opts.cache_dir.join(d))?;
@@ -27,15 +37,16 @@ pub(super) async fn plan<'a>(
     // image, the build goal is already realized — no lookups or VM builds
     // can be needed (delete an output image in .cache/erofs to force a
     // rebuild).
-    let mut images: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
     if drvs[root]
         .outputs
         .values()
         .all(|o| image_path(opts, &o.path).exists())
     {
-        for o in drvs[root].outputs.values() {
-            images.insert(o.path.clone(), image_path(opts, &o.path));
-        }
+        let images = drvs[root]
+            .outputs
+            .values()
+            .map(|o| (o.path.clone(), image_path(opts, &o.path)))
+            .collect();
         println!("build: root outputs already cached locally");
         return Ok(Ctx {
             drvs,
@@ -44,81 +55,115 @@ pub(super) async fn plan<'a>(
             cache,
             plan: Plan {
                 hits: BTreeMap::new(),
-                miss_drv: BTreeMap::new(),
+                fetches: BTreeMap::new(),
+                fetchurl: BTreeMap::new(),
                 to_build: Vec::new(),
             },
             images,
         });
     }
 
-    // local images are preloaded before lookup so builds can reuse them;
-    // narinfo is still fetched for every path (including cached ones) because
-    // the References lines keep input sets exact — the superset fallback
-    // via drv inputs would pull in unneeded build-time deps
-    let to_lookup: Vec<&String> = closure.store_paths.iter().collect();
-    let mut images: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-    for p in &to_lookup {
-        let img = image_path(opts, p);
-        if img.exists() {
-            images.insert((*p).clone(), img);
-        }
-    }
-    println!(
-        "build: {} images cached from earlier runs, looking up {} paths",
-        images.len(),
-        to_lookup.len()
-    );
-
-    let lookups = lookup_batched(&cache, &to_lookup).await?;
+    // preload existing images; disk-cached narinfo gives exact references
+    // for them (narinfo is never needed on the network for these — a
+    // locally built path has no upstream narinfo anyway)
+    let mut images: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut hits = BTreeMap::new();
-    let mut miss_drv = BTreeMap::new();
-    let mut to_build = BTreeSet::new();
-    for (_i, p, lookup) in lookups {
-        match lookup {
-            Some(nar) => {
-                hits.insert(p, nar);
-            }
-            None => {
-                let dp = producing_drv(closure, drvs, &p)
-                    .ok_or_else(|| anyhow!("no drv in closure produces {p}"))?;
-                miss_drv.insert(p.clone(), dp.clone());
-                // outputs realized by an earlier run: keep the image, skip the build
-                if drvs[&dp]
-                    .outputs
-                    .values()
-                    .all(|o| images.contains_key(&o.path))
-                {
-                    println!(
-                        "[cache] {}: output image already present",
-                        nix_drv::basename(&p)
-                    );
-                    continue;
-                }
-                if drvs[&dp].builder != "builtin:fetchurl" {
-                    println!("[miss] {}: will build {}", nix_drv::basename(&p), dp);
-                    to_build.insert(dp);
-                } else {
-                    println!(
-                        "[miss] {}: builtin:fetchurl, will realize on demand",
-                        nix_drv::basename(&p)
-                    );
-                }
+    for p in &closure.store_paths {
+        let img = image_path(opts, p);
+        if !img.exists() {
+            continue;
+        }
+        images.insert(p.clone(), img);
+        if let Ok(hash) = StorePathHash::from_store_path(p) {
+            if let Ok(Some(Lookup::Hit(nar))) = cache.lookup_local(&hash) {
+                hits.insert(p.clone(), nar);
             }
         }
     }
+    println!("build: {} images cached from earlier runs", images.len());
 
-    Ok(Ctx {
+    let mut ctx = Ctx {
         drvs,
         closure,
         opts,
         cache,
         plan: Plan {
             hits,
-            miss_drv,
-            to_build: topo_order(drvs, &to_build, root),
+            fetches: BTreeMap::new(),
+            fetchurl: BTreeMap::new(),
+            to_build: Vec::new(),
         },
         images,
-    })
+    };
+    resolve(&mut ctx, root).await?;
+    Ok(ctx)
+}
+
+async fn resolve(ctx: &mut Ctx<'_>, root: &str) -> anyhow::Result<()> {
+    let mut to_build: BTreeSet<String> = BTreeSet::new();
+    // (store path, expand references?) — expansion only applies to inputs
+    // of builds; the root outputs are the goal itself, not build inputs
+    let mut frontier: VecDeque<(String, bool)> = ctx.drvs[root]
+        .outputs
+        .values()
+        .map(|o| (o.path.clone(), false))
+        .collect();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+
+    while let Some((p, expand)) = frontier.pop_front() {
+        if !done.insert(p.clone()) {
+            continue;
+        }
+        if ctx.images.contains_key(&p)
+            || ctx.plan.fetches.contains_key(&p)
+            || ctx.plan.fetchurl.contains_key(&p)
+        {
+            // already materialized (or queued); fall through to expansion
+        } else {
+            let hash = StorePathHash::from_store_path(&p)?;
+            match ctx.cache.lookup(&hash).await {
+                Ok(Lookup::Hit(nar)) => {
+                    println!("[hit] {}", nix_drv::basename(&p));
+                    ctx.plan.hits.insert(p.clone(), nar.clone());
+                    ctx.plan.fetches.insert(p.clone(), nar);
+                }
+                Ok(Lookup::Miss) => {
+                    let dp = producing_drv(ctx.closure, ctx.drvs, &p)
+                        .ok_or_else(|| anyhow!("no drv in closure produces {p}"))?;
+                    if ctx.drvs[&dp].builder == "builtin:fetchurl" {
+                        println!(
+                            "[miss] {}: builtin:fetchurl, will realize on demand",
+                            nix_drv::basename(&p)
+                        );
+                        ctx.plan.fetchurl.insert(p.clone(), dp.clone());
+                    } else if to_build.insert(dp.clone()) {
+                        println!("[miss] {}: will build {}", nix_drv::basename(&p), dp);
+                        for inp in ctx.drv_direct_inputs(&dp) {
+                            frontier.push_back((inp, true));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("looking up {}", nix_drv::basename(&p))));
+                }
+            }
+        }
+        if expand {
+            for r in ctx.refs_of(&p) {
+                frontier.push_back((r, true));
+            }
+        }
+    }
+
+    println!(
+        "build: {} to fetch, {} fetchurl, {} to build",
+        ctx.plan.fetches.len(),
+        ctx.plan.fetchurl.len(),
+        to_build.len()
+    );
+    ctx.plan.to_build = topo_order(ctx.drvs, &to_build, root);
+    Ok(())
 }
 
 fn topo_order(drvs: &Derivations, to_build: &BTreeSet<String>, root: &str) -> Vec<String> {
@@ -145,33 +190,4 @@ fn topo_order(drvs: &Derivations, to_build: &BTreeSet<String>, root: &str) -> Ve
     }
     visit(drvs, to_build, root, &mut seen, &mut out);
     out
-}
-
-async fn lookup_batched(
-    cache: &nix_cache::NixCache,
-    queue: &[&String],
-) -> anyhow::Result<Vec<(usize, String, Option<nix_cache::CachedNar>)>> {
-    let results = stream::iter(queue.iter().enumerate())
-        .map(|(i, p)| {
-            let cache = cache.clone();
-            async move {
-                let hash = StorePathHash::from_store_path(p)?;
-                let r = match cache.lookup(&hash).await {
-                    Ok(Lookup::Hit(nar)) => Some(nar),
-                    Ok(Lookup::Miss) => None,
-                    Err(e) => return Err(anyhow::Error::from(e)),
-                };
-                Ok((i, p.as_str(), r))
-            }
-        })
-        .buffer_unordered(super::MAX_CONCURRENT_FETCHES)
-        .collect::<Vec<anyhow::Result<(usize, &str, Option<nix_cache::CachedNar>)>>>()
-        .await;
-    let mut out = Vec::new();
-    for r in results {
-        let (i, p, l) = r?;
-        out.push((i, p.to_string(), l));
-    }
-    out.sort_by_key(|(i, _, _)| *i);
-    Ok(out)
 }

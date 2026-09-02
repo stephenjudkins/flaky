@@ -26,6 +26,10 @@ pub struct OutputSpec {
     pub name: String,
     /// Absolute store path of this output.
     pub store_path: String,
+    /// Guest block device node backing this output, e.g. "/dev/vda". The
+    /// host attaches output devices to the VM in `outputs` order and the
+    /// kernel enumerates virtio-blk devices in attachment order.
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

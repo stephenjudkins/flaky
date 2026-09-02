@@ -1,6 +1,5 @@
-use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom as StdSeekFrom};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -14,47 +13,6 @@ use tokio::io::AsyncRead;
 
 const IMAGE_DIR: &str = "/run/flaky-images";
 const IMAGE_TAG: &str = "flaky-images";
-
-struct Devices {
-    outputs: BTreeMap<String, PathBuf>,
-}
-
-fn read_at(path: &Path, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = fs::File::open(path)?;
-    f.seek(StdSeekFrom::Start(off))?;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-fn cstr(buf: &[u8]) -> String {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
-}
-
-fn discover_devices() -> std::io::Result<Devices> {
-    let mut devs = Devices {
-        outputs: BTreeMap::new(),
-    };
-    let mut names: Vec<String> = fs::read_dir("/sys/block")?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("vd"))
-        .collect();
-    names.sort();
-    for name in names {
-        let path = PathBuf::from("/dev").join(&name);
-        let label = read_at(&path, apis::OUTPUT_LABEL_OFFSET, 64)?;
-        let label = cstr(&label);
-        if let Some(out) = label.strip_prefix(apis::OUTPUT_LABEL_PREFIX) {
-            println!("guest: {name}: output device for output {out}");
-            devs.outputs.insert(out.to_string(), path);
-        } else {
-            println!("guest: {name}: unrecognized device (label {label:?})");
-        }
-    }
-    Ok(devs)
-}
 
 pub(crate) fn mount_err<T>(r: nix::Result<T>, what: &str) -> std::io::Result<T> {
     r.map_err(|e| std::io::Error::other(format!("{what}: {e}")))
@@ -434,16 +392,6 @@ async fn run_build_inner(req: BuildRequest) -> std::io::Result<BuildResult> {
     );
     mount_base()?;
     mount_image_files()?;
-    let devices = discover_devices()?;
-    for out in &req.outputs {
-        if !devices.outputs.contains_key(&out.name) {
-            return Err(std::io::Error::other(format!(
-                "output device for {} not found",
-                out.name
-            )));
-        }
-    }
-
     setup_mounts(&req)?;
     let env = prepare_env(&req)?;
 
@@ -468,13 +416,10 @@ async fn run_build_inner(req: BuildRequest) -> std::io::Result<BuildResult> {
 
     let mut outputs = Vec::new();
     for out in &req.outputs {
-        let dev = &devices.outputs[&out.name];
-        let size = pack_output(&out.store_path, dev).await?;
+        let size = pack_output(&out.store_path, Path::new(&out.device)).await?;
         println!(
             "guest: packed {} into {} ({} bytes)",
-            out.store_path,
-            dev.display(),
-            size
+            out.store_path, out.device, size
         );
         outputs.push(OutputImage {
             name: out.name.clone(),

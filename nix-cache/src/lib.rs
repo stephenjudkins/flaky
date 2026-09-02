@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use nar_to_erofs::NarDecoder;
 use narinfo::NarInfo;
 use reqwest::IntoUrl;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, BufReader};
@@ -72,10 +73,17 @@ impl std::fmt::Display for StorePathHash {
 }
 
 /// A nix binary cache, e.g. `https://cache.nixos.org`.
+///
+/// When configured with [`NixCache::with_disk_cache`], narinfo hits are
+/// memoized on disk forever: a narinfo is immutable, content-addressed
+/// data. Misses are not recorded — lookups only happen for paths being
+/// materialized, which is exactly when a fresh answer is wanted (the path
+/// may have appeared upstream since).
 #[derive(Clone)]
 pub struct NixCache {
     base: reqwest::Url,
     client: reqwest::Client,
+    disk: Option<PathBuf>,
 }
 
 /// Owned summary of a narinfo hit; just what's needed to stream the NAR.
@@ -129,11 +137,58 @@ impl NixCache {
         Ok(NixCache {
             base,
             client: reqwest::Client::new(),
+            disk: None,
         })
     }
 
-    /// Fetches `<base>/<hash>.narinfo` if present.
+    /// Memoizes narinfo lookups under `root/<cache-host>/<hash>.narinfo`.
+    pub fn with_disk_cache(mut self, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        self.disk = Some(root.join(host_key(&self.base)));
+        self
+    }
+
+    /// Disk-only lookup: returns a hit previously memoized by `lookup`,
+    /// without touching the network. Legacy negative-marker files are
+    /// removed on sight.
+    pub fn lookup_local(&self, hash: &StorePathHash) -> Result<Option<Lookup>> {
+        let Some(dir) = &self.disk else {
+            return Ok(None);
+        };
+        let path = dir.join(format!("{hash}.narinfo"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        if text.starts_with("miss") {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+        match parse_narinfo(&text) {
+            Ok(nar) => Ok(Some(Lookup::Hit(nar))),
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("warning: discarding corrupt cached narinfo {path:?}: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    fn write_local(&self, hash: &StorePathHash, contents: &str) {
+        let Some(dir) = &self.disk else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let _ = std::fs::write(dir.join(format!("{hash}.narinfo")), contents);
+    }
+
+    /// Fetches `<base>/<hash>.narinfo`, consulting the local disk cache
+    /// first when configured.
     pub async fn lookup(&self, hash: &StorePathHash) -> Result<Lookup> {
+        if let Some(found) = self.lookup_local(hash)? {
+            return Ok(found);
+        }
         let url = self
             .base
             .join(&format!("{hash}.narinfo"))
@@ -144,42 +199,9 @@ impl NixCache {
         }
         let resp = resp.error_for_status()?;
         let text = resp.text().await?;
-        // the narinfo crate rejects unknown keys (e.g. the modern `CA:` line);
-        // drop lines it doesn't know before parsing
-        const KNOWN: &[&str] = &[
-            "StorePath",
-            "URL",
-            "Compression",
-            "FileHash",
-            "NarHash",
-            "NarSize",
-            "FileSize",
-            "Deriver",
-            "System",
-            "References",
-            "Sig",
-        ];
-        let filtered: String = text
-            .lines()
-            .filter(|l| {
-                l.split_once(':')
-                    .map(|(k, _)| KNOWN.contains(&k))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let info = NarInfo::parse(&filtered).map_err(|e| Error::Narinfo(format!("{e:?}")))?;
-        Ok(Lookup::Hit(CachedNar {
-            url: info.url.to_string(),
-            compression: Compression::from_narinfo(info.compression.as_deref(), info.url),
-            nar_size: info.nar_size as u64,
-            references: info
-                .references
-                .iter()
-                .map(|r| r.to_string())
-                .filter(|r| !r.is_empty())
-                .collect(),
-        }))
+        let nar = parse_narinfo(&text)?;
+        self.write_local(hash, &text);
+        Ok(Lookup::Hit(nar))
     }
 
     /// Opens a decompressed NAR stream for the given cache hit.
@@ -202,6 +224,61 @@ impl NixCache {
 
 fn swallow(e: reqwest::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e)
+}
+
+fn host_key(base: &reqwest::Url) -> String {
+    let mut s = base.host_str().unwrap_or("cache").to_string();
+    if let Some(port) = base.port() {
+        s.push_str(&format!("-{port}"));
+    }
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn parse_narinfo(text: &str) -> Result<CachedNar> {
+    // the narinfo crate rejects unknown keys (e.g. the modern `CA:` line);
+    // drop lines it doesn't know before parsing
+    const KNOWN: &[&str] = &[
+        "StorePath",
+        "URL",
+        "Compression",
+        "FileHash",
+        "NarHash",
+        "NarSize",
+        "FileSize",
+        "Deriver",
+        "System",
+        "References",
+        "Sig",
+    ];
+    let filtered: String = text
+        .lines()
+        .filter(|l| {
+            l.split_once(':')
+                .map(|(k, _)| KNOWN.contains(&k))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let info = NarInfo::parse(&filtered).map_err(|e| Error::Narinfo(format!("{e:?}")))?;
+    Ok(CachedNar {
+        url: info.url.to_string(),
+        compression: Compression::from_narinfo(info.compression.as_deref(), info.url),
+        nar_size: info.nar_size as u64,
+        references: info
+            .references
+            .iter()
+            .map(|r| r.to_string())
+            .filter(|r| !r.is_empty())
+            .collect(),
+    })
 }
 
 /// Streams a NAR from the cache into an EROFS image on `sink`, verifying
@@ -305,6 +382,49 @@ mod tests {
             "846h582z2d4mifn4km7axlqllcyn6zdg"
         );
         assert!(StorePathHash::from_store_path("/some/other/path").is_err());
+    }
+
+    fn disk_cache() -> (NixCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = NixCache::new("https://cache.nixos.org")
+            .unwrap()
+            .with_disk_cache(dir.path());
+        (cache, dir)
+    }
+
+    const NARINFO: &str = "StorePath: /nix/store/846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3\nURL: nar/846h582z2d4mifn4km7axlqllcyn6zdg.nar.xz\nCompression: xz\nFileHash: sha256-tQjFHAWTPDNBSqyI2DWfxFOh7MjcUWTOk+frQdpatkc=\nFileSize: 196040\nNarHash: sha256-F+zLLMvODPI7SRDEKQG7i7KOJc7m0S9HITrFhUiVRNA=\nNarSize: 741000\nReferences: abcdefghijklmnopqrstuvwx12345678-name\nDeriver: 7pgxjakchwmnbjvkqrym0sqjw29jpgsa-hello-2.12.3.drv\nSystem: aarch64-linux\nSig: cache.nixos.org-1:fake\n";
+
+    #[tokio::test]
+    async fn disk_cache_serves_hits_without_network() {
+        let (cache, dir) = disk_cache();
+        let hash = StorePathHash::new("846h582z2d4mifn4km7axlqllcyn6zdg").unwrap();
+        cache.write_local(&hash, NARINFO);
+        let Lookup::Hit(nar) = cache.lookup(&hash).await.unwrap() else {
+            panic!("expected hit");
+        };
+        assert_eq!(nar.url, "nar/846h582z2d4mifn4km7axlqllcyn6zdg.nar.xz");
+        assert_eq!(nar.nar_size, 741000);
+        assert_eq!(
+            nar.references,
+            vec!["abcdefghijklmnopqrstuvwx12345678-name"]
+        );
+        assert!(dir.path().join("cache.nixos.org").exists());
+    }
+
+    #[test]
+    fn legacy_miss_markers_are_removed() {
+        let (cache, _dir) = disk_cache();
+        let hash = StorePathHash::new("846h582z2d4mifn4km7axlqllcyn6zdg").unwrap();
+        cache.write_local(&hash, "miss 12345\n");
+        assert!(cache.lookup_local(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_entries_are_discarded() {
+        let (cache, _dir) = disk_cache();
+        let hash = StorePathHash::new("846h582z2d4mifn4km7axlqllcyn6zdg").unwrap();
+        cache.write_local(&hash, "garbage: yes\n");
+        assert!(cache.lookup_local(&hash).unwrap().is_none());
     }
 
     #[test]

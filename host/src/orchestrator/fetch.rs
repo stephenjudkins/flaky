@@ -35,8 +35,7 @@ async fn fetch_one_image(
     Ok(())
 }
 
-pub(super) async fn fetch_images(ctx: &mut Ctx<'_>, paths: Vec<String>) -> anyhow::Result<()> {
-    let total = paths.len();
+pub(super) async fn fetch_images(ctx: &mut Ctx<'_>) -> anyhow::Result<()> {
     let Ctx {
         drvs,
         cache,
@@ -44,41 +43,41 @@ pub(super) async fn fetch_images(ctx: &mut Ctx<'_>, paths: Vec<String>) -> anyho
         opts,
         ..
     } = &*ctx;
-    let results = stream::iter(paths.into_iter().enumerate())
-        .map(|(i, p)| {
-            let cache = cache.clone();
-            async move {
-                let dest = image_path(opts, &p);
-                let img = if let Some(nar) = plan.hits.get(&p) {
-                    fetch_one_image(&cache, &p, nar, &dest).await?;
-                    dest
-                } else if let Some(dp) = plan.miss_drv.get(&p) {
-                    if drvs[dp].builder != "builtin:fetchurl" {
-                        anyhow::bail!("{p} is an output of {dp} which has not been built");
-                    }
-                    let n =
-                        fetchurl::realize_to_image(&drvs[dp], &dest, &opts.cache_dir.join("tmp"))
-                            .await
-                            .with_context(|| format!("realizing fetchurl for {p}"))?;
-                    println!(
-                        "[{}/{}] realized fetchurl {} ({} bytes)",
-                        i + 1,
-                        total,
-                        nix_drv::basename(&p),
-                        n
-                    );
-                    dest
-                } else {
-                    anyhow::bail!("no source for input {p}");
-                };
-                Ok((p, img))
-            }
-        })
-        .buffer_unordered(super::MAX_CONCURRENT_FETCHES)
-        .collect::<Vec<anyhow::Result<(String, PathBuf)>>>()
-        .await;
+    let total = plan.fetches.len() + plan.fetchurl.len();
+    println!("build: fetching {total} input images");
+
+    let downloads = stream::iter(plan.fetches.iter().map(|(p, nar)| {
+        let cache = cache.clone();
+        let p = p.clone();
+        let nar = nar.clone();
+        async move {
+            let dest = image_path(opts, &p);
+            fetch_one_image(&cache, &p, &nar, &dest).await?;
+            Ok((p, dest))
+        }
+    }))
+    .buffer_unordered(super::MAX_CONCURRENT_FETCHES)
+    .collect::<Vec<anyhow::Result<(String, PathBuf)>>>()
+    .await;
+
+    let realizes = stream::iter(plan.fetchurl.iter().map(|(p, dp)| {
+        let dp = dp.clone();
+        let p = p.clone();
+        async move {
+            let dest = image_path(opts, &p);
+            let n = fetchurl::realize_to_image(&drvs[&dp], &dest, &opts.cache_dir.join("tmp"))
+                .await
+                .with_context(|| format!("realizing fetchurl for {p}"))?;
+            println!("realized fetchurl {} ({} bytes)", nix_drv::basename(&p), n);
+            Ok((p, dest))
+        }
+    }))
+    .buffer_unordered(super::MAX_CONCURRENT_FETCHES)
+    .collect::<Vec<anyhow::Result<(String, PathBuf)>>>()
+    .await;
+
     let mut done = 0;
-    for r in results {
+    for r in downloads.into_iter().chain(realizes) {
         let (p, img) = r?;
         done += 1;
         ctx.images.insert(p, img);

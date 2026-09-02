@@ -1,6 +1,8 @@
-//! Host-side build orchestration: resolve the closure, figure out which
-//! store paths are available from a binary cache, and build whatever is
-//! left (including the root) inside microVMs.
+//! Host-side build orchestration: figure out which missing store paths
+//! can be fetched from a binary cache and which derivations must be built
+//! in microVMs. Narinfo lookups are lazy: a path is only looked up at the
+//! moment we must materialize it and its EROFS image is absent, so a warm
+//! cache does zero network requests.
 //!
 //! Every store path gets its own EROFS image in `.cache/erofs/<hash>.erofs`
 //! (volume name = first 16 chars of the hash). Build inputs are exposed as
@@ -35,11 +37,15 @@ pub struct BuildOpts {
 }
 
 struct Plan {
-    /// Cache hits: store path -> narinfo summary (incl. references).
+    /// Narinfo summaries (incl. references): preloaded from the local
+    /// narinfo cache for image-present paths, plus everything fetched or
+    /// looked up this run. Also drives `refs_of`.
     hits: BTreeMap<String, CachedNar>,
-    /// Paths not in the cache: output path -> producing drv path.
-    miss_drv: BTreeMap<String, String>,
-    /// Store paths to build (drv paths, dependencies first).
+    /// Missing paths available upstream: store path -> narinfo.
+    fetches: BTreeMap<String, CachedNar>,
+    /// Missing paths realized from builtin:fetchurl drvs: path -> drv.
+    fetchurl: BTreeMap<String, String>,
+    /// Drvs to build (dependencies first).
     to_build: Vec<String>,
 }
 
@@ -81,28 +87,7 @@ pub async fn run(opts: BuildOpts) -> anyhow::Result<String> {
     );
 
     let mut ctx = plan::plan(&drvs, &closure, &root, &opts).await?;
-    // prefetch images for the union of all builds' input sets
-    let mut needed: BTreeSet<String> = BTreeSet::new();
-    for dp in ctx.plan.to_build.clone() {
-        needed.extend(ctx.input_set(&dp)?);
-    }
-    // ensure root outputs materialize even when the whole closure is cached
-    needed.extend(drvs[&root].outputs.values().map(|o| o.path.clone()));
-    let building: BTreeSet<String> = ctx.plan.to_build.clone().into_iter().collect();
-    let fetchable: Vec<String> = needed
-        .into_iter()
-        .filter(|p| {
-            if ctx.images.contains_key(&*p) {
-                return false;
-            }
-            match ctx.plan.miss_drv.get(&*p) {
-                Some(dp) => !building.contains(dp),
-                None => true,
-            }
-        })
-        .collect();
-    println!("build: fetching {} input images", fetchable.len());
-    fetch::fetch_images(&mut ctx, fetchable).await?;
+    fetch::fetch_images(&mut ctx).await?;
     for drv_path in ctx.plan.to_build.clone() {
         exec::build_one(&mut ctx, &drv_path).await?;
     }
@@ -150,12 +135,7 @@ impl<'a> Ctx<'a> {
                 .map(|name| format!("/nix/store/{name}"))
                 .collect();
         }
-        let dp = self
-            .plan
-            .miss_drv
-            .get(path)
-            .cloned()
-            .or_else(|| producing_drv(self.closure, self.drvs, path));
+        let dp = producing_drv(self.closure, self.drvs, path);
         let Some(dp) = dp else {
             return Vec::new();
         };

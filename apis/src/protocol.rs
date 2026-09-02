@@ -1,12 +1,6 @@
 //! Constants and naming conventions shared by host and guest. Both sides
-//! must agree on these for the virtio-fs image files, EROFS volume names,
-//! and output-device labels to line up.
-
-/// Offset of the output label within an output block device.
-pub const OUTPUT_LABEL_OFFSET: u64 = 65536;
-/// Prefix of the label written into an output block device; the rest is
-/// the output name, e.g. `flaky-out:out`.
-pub const OUTPUT_LABEL_PREFIX: &str = "flaky-out:";
+//! must agree on these for the virtio-fs image files and EROFS volume names
+//! to line up.
 
 /// The hash part of a store path (`/nix/store/<hash>-name` -> `<hash>`).
 pub fn store_hash(store_path: &str) -> &str {

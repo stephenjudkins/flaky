@@ -11,21 +11,28 @@ use crate::vm::{BlkDev, Vm, VmSpec};
 const OUTPUT_DEVICE_SIZE: u64 = 4 << 30;
 const MAX_OUTPUT_DEVICES: usize = 29;
 
-fn prep_output_device(path: &std::path::Path, output_name: &str) -> anyhow::Result<()> {
+/// Guest device node for the n-th virtio-blk device (vda..vdz, vdaa...).
+fn blk_device(index: usize) -> String {
+    let mut letters = Vec::new();
+    let mut i = index;
+    loop {
+        letters.push((b'a' + (i % 26) as u8) as char);
+        if i < 26 {
+            break;
+        }
+        i = i / 26 - 1;
+    }
+    letters.reverse();
+    format!("/dev/vd{}", letters.into_iter().collect::<String>())
+}
+
+fn prep_output_device(path: &std::path::Path) -> anyhow::Result<()> {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
     f.set_len(OUTPUT_DEVICE_SIZE)?;
-    let mut label = vec![0u8; 64];
-    let l = format!("{}{output_name}", apis::OUTPUT_LABEL_PREFIX);
-    label[..l.len()].copy_from_slice(l.as_bytes());
-    use std::io::{Seek, SeekFrom, Write};
-    let mut f = f;
-    f.seek(SeekFrom::Start(apis::OUTPUT_LABEL_OFFSET))?;
-    f.write_all(&label)?;
-    f.sync_all()?;
     Ok(())
 }
 
@@ -74,7 +81,7 @@ pub(super) async fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Resu
             .cache_dir
             .join("build")
             .join(format!("{}-{name}.img", &apis::store_hash(&out.path)[..16]));
-        prep_output_device(&dev_path, name)
+        prep_output_device(&dev_path)
             .with_context(|| format!("preparing output device for {name}"))?;
         blk.push(BlkDev {
             path: dev_path.clone(),
@@ -94,9 +101,11 @@ pub(super) async fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Resu
             .collect(),
         outputs: outputs
             .iter()
-            .map(|(name, out)| apis::OutputSpec {
+            .enumerate()
+            .map(|(i, (name, out))| apis::OutputSpec {
                 name: name.to_string(),
                 store_path: out.path.clone(),
+                device: blk_device(i),
             })
             .collect(),
         inputs: input_specs,
