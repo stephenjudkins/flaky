@@ -340,17 +340,22 @@ async fn pack_output(store_path: &str, dev: &Path) -> std::io::Result<u64> {
     let md = fs::symlink_metadata(path)?;
     if md.is_dir() {
         pack_dir(&mut writer, path, base).await?;
+    } else if md.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        writer
+            .symlink(
+                base,
+                target.as_os_str().as_encoded_bytes(),
+                InodeMeta::symlink(),
+            )
+            .await?;
     } else {
-        // image root is a directory holding the file under its basename
-        writer.mkdir(base, InodeMeta::dir(0o755)).await?;
         let mut meta = InodeMeta::reg((md.mode() & 0o7777) as u16);
         if md.mode() & 0o111 != 0 {
             meta.mode = 0o100555;
         }
         let mut r = SyncReader(fs::File::open(path)?);
-        writer
-            .add_file(&format!("{base}/{base}"), meta, md.len(), &mut r)
-            .await?;
+        writer.add_file(base, meta, md.len(), &mut r).await?;
     }
     let (file, size) = nar_to_erofs::finish_image(writer)
         .await
@@ -377,16 +382,22 @@ pub async fn pack_store_paths(paths: &[String], dev: &Path) -> std::io::Result<u
         let md = fs::symlink_metadata(path)?;
         if md.is_dir() {
             pack_dir(&mut writer, path, base).await?;
+        } else if md.file_type().is_symlink() {
+            let target = fs::read_link(path)?;
+            writer
+                .symlink(
+                    base,
+                    target.as_os_str().as_encoded_bytes(),
+                    InodeMeta::symlink(),
+                )
+                .await?;
         } else {
-            writer.mkdir(base, InodeMeta::dir(0o755)).await?;
             let mut meta = InodeMeta::reg((md.mode() & 0o7777) as u16);
             if md.mode() & 0o111 != 0 {
                 meta.mode = 0o100555;
             }
             let mut r = SyncReader(fs::File::open(path)?);
-            writer
-                .add_file(&format!("{base}/{base}"), meta, md.len(), &mut r)
-                .await?;
+            writer.add_file(base, meta, md.len(), &mut r).await?;
         }
     }
     let (file, size) = nar_to_erofs::finish_image(writer)
