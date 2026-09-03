@@ -158,22 +158,18 @@ impl Vm {
         F: FnOnce(crate::rpc::GuestApiClient) -> Fut,
         Fut: Future<Output = anyhow::Result<T>>,
     {
-        let guest_api_stream = tokio::net::UnixStream::from_std(
-            tokio::time::timeout(
-                GUEST_CONNECT_TIMEOUT,
-                self.vsock_host.accept(apis::GUEST_API_PORT),
-            )
-            .await
-            .context("timed out waiting for guest api connection")??,
-        )?;
-        let host_api_stream = tokio::net::UnixStream::from_std(
-            tokio::time::timeout(
-                GUEST_CONNECT_TIMEOUT,
-                self.vsock_host.accept(apis::HOST_API_PORT),
-            )
-            .await
-            .context("timed out waiting for host api connection")??,
-        )?;
+        let guest_api_stream = tokio::time::timeout(
+            GUEST_CONNECT_TIMEOUT,
+            self.vsock_host.accept(apis::GUEST_API_PORT),
+        )
+        .await
+        .context("timed out waiting for guest api connection")??;
+        let host_api_stream = tokio::time::timeout(
+            GUEST_CONNECT_TIMEOUT,
+            self.vsock_host.accept(apis::HOST_API_PORT),
+        )
+        .await
+        .context("timed out waiting for host api connection")??;
         let mut conn = crate::rpc::GuestApiConnection::new(guest_api_stream);
         let host_api = crate::rpc::serve_host_api(host_api_stream, crate::host_api::HostApiServer);
         tokio::pin!(host_api);

@@ -12,6 +12,7 @@ mod orchestrator;
 mod rpc;
 mod vm;
 mod vsock_device;
+mod vsock_pipe;
 
 #[derive(Parser)]
 struct Cli {

@@ -8,7 +8,7 @@ use apis::tarpc::{ClientMessage, Response};
 use apis::{GuestApiRequest, GuestApiResponse, HostApi, HostApiRequest, HostApiResponse, Postcard};
 use futures::prelude::*;
 
-pub type ByteStream = tokio::net::UnixStream;
+use crate::vsock_pipe::VsockStream;
 
 /// tarpc's `context::current()` defaults to a 10s request deadline;
 /// builds and evals run far longer than that.
@@ -17,6 +17,8 @@ pub fn rpc_context() -> apis::tarpc::context::Context {
     ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(6 * 3600);
     ctx
 }
+
+pub type ByteStream = VsockStream;
 
 type GuestApiCodec = Postcard<Response<GuestApiResponse>, ClientMessage<GuestApiRequest>>;
 pub type GuestApiTransport = Transport<

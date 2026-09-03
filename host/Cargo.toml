@@ -18,7 +18,6 @@ futures.workspace = true
 libc.workspace = true
 log.workspace = true
 mio.workspace = true
-nix.workspace = true
 nix-cache.workspace = true
 nix-drv.workspace = true
 nar-to-erofs.workspace = true

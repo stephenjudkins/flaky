@@ -1,8 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write};
+use std::io::{self, ErrorKind, IoSlice, IoSliceMut};
 use std::num::Wrapping;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -16,8 +14,9 @@ use alioth::virtio::worker::mio::{ActiveMio, Mio, VirtioMio};
 use alioth::virtio::{DeviceId, IrqSender, VirtioFeature};
 use flume::Receiver;
 use mio::event::Event;
-use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
+
+use crate::vsock_pipe::{PipeDevEnd, VsockPipe, VsockStream, WakeFn};
 
 type Result<T> = std::result::Result<T, alioth::virtio::Error>;
 
@@ -101,27 +100,6 @@ impl Hdr {
     }
 }
 
-fn socketpair() -> io::Result<(UnixStream, UnixStream)> {
-    use nix::fcntl::{F_SETFD, FdFlag, fcntl};
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, setsockopt, sockopt};
-    // SOCK_NONBLOCK/SOCK_CLOEXEC aren't supported by darwin socketpair(2)
-    let (a, b) = nix::sys::socket::socketpair(
-        AddressFamily::Unix,
-        SockType::Stream,
-        None,
-        SockFlag::empty(),
-    )?;
-    let mut streams = [UnixStream::from(a), UnixStream::from(b)];
-    for s in &mut streams {
-        s.set_nonblocking(true)?;
-        fcntl(&*s, F_SETFD(FdFlag::FD_CLOEXEC))?;
-        setsockopt(&*s, sockopt::SndBuf, &(1 << 21))?;
-        setsockopt(&*s, sockopt::RcvBuf, &(1 << 21))?;
-    }
-    let [a, b] = streams;
-    Ok((a, b))
-}
-
 #[derive(Debug)]
 enum ConnState {
     Established { fwd_cnt: Wrapping<u32> },
@@ -131,32 +109,33 @@ enum ConnState {
 #[derive(Debug)]
 struct Connection {
     state: ConnState,
-    reader: UnixStream,
-    writer: UnixStream,
+    pipe: PipeDevEnd,
     pending: Vec<u8>,
 }
 
 impl Connection {
-    fn established(stream: UnixStream) -> io::Result<Self> {
-        Ok(Connection {
+    fn established(pipe: PipeDevEnd) -> Self {
+        Connection {
             state: ConnState::Established {
                 fwd_cnt: Wrapping(0),
             },
-            writer: stream.try_clone()?,
-            reader: stream,
+            pipe,
             pending: Vec::new(),
-        })
+        }
     }
 }
 
 fn flush_pending(conn: &mut Connection) -> io::Result<usize> {
     let mut total = 0usize;
     while !conn.pending.is_empty() {
-        match conn.writer.write(&conn.pending) {
-            Ok(0) => break,
+        match conn.pipe.try_write(&conn.pending) {
             Ok(n) => {
                 total += n;
-                conn.pending.drain(..n);
+                if n == conn.pending.len() {
+                    conn.pending.clear();
+                } else {
+                    conn.pending.drain(..n);
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
@@ -167,8 +146,8 @@ fn flush_pending(conn: &mut Connection) -> io::Result<usize> {
 
 #[derive(Debug, Default)]
 struct PortState {
-    queue: VecDeque<UnixStream>,
-    listener: Option<tokio::sync::oneshot::Sender<UnixStream>>,
+    queue: VecDeque<VsockStream>,
+    listener: Option<tokio::sync::oneshot::Sender<VsockStream>>,
 }
 
 #[derive(Debug, Default)]
@@ -182,7 +161,7 @@ pub struct VsockHost {
 }
 
 impl VsockHost {
-    pub async fn accept(&self, port: u32) -> io::Result<UnixStream> {
+    pub async fn accept(&self, port: u32) -> io::Result<VsockStream> {
         let receiver = {
             let mut ports = self.shared.ports.lock().unwrap();
             let state = ports.entry(port).or_default();
@@ -231,10 +210,15 @@ impl DevSpec for VsockParam {
             guest_cid: self.cid,
             shared: self.shared,
             connections: HashMap::new(),
-            ports: HashMap::new(),
+            notifier: Arc::new(Mutex::new(Notifier::new()?)),
         })
     }
 }
+
+// must not collide with the queue/kicker tokens used by the mio worker
+const TOKEN_NOTIFY: usize = 1 << 61;
+// matches the 2MiB socket buffers this device used to allocate per connection
+const PIPE_CAPACITY: usize = 1 << 21;
 
 #[derive(Debug)]
 pub struct InProcessVsock {
@@ -243,14 +227,22 @@ pub struct InProcessVsock {
     guest_cid: u32,
     shared: Arc<Shared>,
     connections: HashMap<(u32, u32), Connection>,
-    ports: HashMap<Token, (u32, u32)>,
+    notifier: Arc<Mutex<Notifier>>,
 }
 
 impl InProcessVsock {
+    fn device_wake_fn(&self) -> WakeFn {
+        let notifier = self.notifier.clone();
+        Arc::new(move || {
+            if let Err(e) = notifier.lock().unwrap().notify() {
+                log::debug!("vsock wake: {e}");
+            }
+        })
+    }
+
     fn handle_tx_request<'m, Q, S>(
         &mut self,
         hdr: &Hdr,
-        registry: &Registry,
         irq_sender: &S,
         rx_q: &mut Queue<'_, 'm, Q>,
     ) -> Result<()>
@@ -259,13 +251,7 @@ impl InProcessVsock {
         S: IrqSender,
     {
         let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
-        let (host_end, dev_end) = match socketpair() {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::error!("{}: failed to create socketpair: {e}", self.name);
-                return self.respond_rst(hdr, irq_sender, rx_q);
-            }
-        };
+        let (dev_end, host_end) = VsockPipe::pair(PIPE_CAPACITY, self.device_wake_fn());
         let response = Hdr {
             src_cid: CID_HOST,
             dst_cid: self.guest_cid,
@@ -280,28 +266,12 @@ impl InProcessVsock {
             log::error!("{}: failed to send connection response: {e:?}", self.name);
             return self.respond_rst(hdr, irq_sender, rx_q);
         }
-        let conn = match Connection::established(dev_end) {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::error!("{}: failed to init connection: {e:?}", self.name);
-                return Ok(());
-            }
-        };
-        let token = Token(conn.reader.as_raw_fd() as usize);
-        if let Err(e) = registry.register(
-            &mut SourceFd(&conn.reader.as_raw_fd()),
-            token,
-            Interest::READABLE,
-        ) {
-            log::error!("{}: failed to register socket: {e}", self.name);
-            return Ok(());
-        }
+        let conn = Connection::established(dev_end);
         log::debug!(
             "{}: vm:{guest_port} -> host:{host_port}: established (guest-initiated)",
             self.name
         );
         self.connections.insert((host_port, guest_port), conn);
-        self.ports.insert(token, (host_port, guest_port));
         let mut ports = self.shared.ports.lock().unwrap();
         let state = ports.entry(host_port).or_default();
         if let Some(sender) = state.listener.take() {
@@ -330,7 +300,7 @@ impl InProcessVsock {
                 return Ok(Status::Break);
             }
             write_prefix(&mut desc.writable, &bytes);
-            if !write_prefix_satisfied(&mut desc.writable, &bytes) {
+            if !write_prefix_satisfied(&desc.writable, &bytes) {
                 log::error!("{name}: no buffer space for op {}", hdr.op);
                 return Ok(Status::Break);
             }
@@ -398,21 +368,18 @@ impl InProcessVsock {
         self.respond(&update, irq_sender, rx_q)
     }
 
-    fn remove_conn(&mut self, host_port: u32, guest_port: u32, registry: &Registry) -> Result<()> {
-        let Some(conn) = self.connections.remove(&(host_port, guest_port)) else {
+    fn remove_conn(&mut self, host_port: u32, guest_port: u32) -> Result<()> {
+        // dropping the pipe end closes the host-side stream (EOF/EPIPE)
+        if self.connections.remove(&(host_port, guest_port)).is_none() {
             log::warn!(
                 "{}: vm:{guest_port} -> host:{host_port}: unknown connection",
                 self.name
             );
-            return Ok(());
-        };
-        let token = Token(conn.reader.as_raw_fd() as usize);
-        self.ports.remove(&token);
-        registry.deregister(&mut SourceFd(&conn.reader.as_raw_fd()))?;
+        }
         Ok(())
     }
 
-    fn handle_tx_shutdown(&mut self, hdr: &Hdr, registry: &Registry) -> Result<()> {
+    fn handle_tx_shutdown(&mut self, hdr: &Hdr) -> Result<()> {
         let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
         let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) else {
             log::warn!(
@@ -430,7 +397,7 @@ impl InProcessVsock {
         if flags != SHUTDOWN_BOTH {
             conn.state = ConnState::Shutdown { flags };
         } else {
-            self.remove_conn(host_port, guest_port, registry)?;
+            self.remove_conn(host_port, guest_port)?;
         }
         Ok(())
     }
@@ -438,7 +405,6 @@ impl InProcessVsock {
     fn handle_tx_desc<'m, Q, S>(
         &mut self,
         desc: &mut DescChain<'_>,
-        registry: &Registry,
         irq_sender: &S,
         rx_q: &mut Queue<'_, 'm, Q>,
     ) -> Result<()>
@@ -463,17 +429,17 @@ impl InProcessVsock {
         );
         match hdr.op {
             OP_REQUEST => {
-                self.handle_tx_request(&hdr, registry, irq_sender, rx_q)?;
-                self.transfer_rx_data(hdr.dst_port, hdr.src_port, registry, rx_q, irq_sender)?;
+                self.handle_tx_request(&hdr, irq_sender, rx_q)?;
+                self.transfer_rx_data(hdr.dst_port, hdr.src_port, rx_q, irq_sender)?;
             }
             OP_RW => {
-                self.transfer_tx_data(&hdr, &desc.readable, registry)?;
+                self.transfer_tx_data(&hdr, &desc.readable)?;
                 self.send_credit_update(hdr.dst_port, hdr.src_port, irq_sender, rx_q)?;
             }
             OP_RST => {
-                self.remove_conn(hdr.dst_port, hdr.src_port, registry)?;
+                self.remove_conn(hdr.dst_port, hdr.src_port)?;
             }
-            OP_SHUTDOWN => self.handle_tx_shutdown(&hdr, registry)?,
+            OP_SHUTDOWN => self.handle_tx_shutdown(&hdr)?,
             OP_CREDIT_UPDATE => {}
             OP_CREDIT_REQUEST => {
                 self.send_credit_update(hdr.dst_port, hdr.src_port, irq_sender, rx_q)?;
@@ -483,7 +449,7 @@ impl InProcessVsock {
         Ok(())
     }
 
-    fn transfer_tx_data(&mut self, hdr: &Hdr, bufs: &[IoSlice], registry: &Registry) -> Result<()> {
+    fn transfer_tx_data(&mut self, hdr: &Hdr, bufs: &[IoSlice]) -> Result<()> {
         let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
         let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) else {
             log::warn!(
@@ -524,18 +490,11 @@ impl InProcessVsock {
         let flushed = match flush_pending(conn) {
             Ok(n) => n,
             Err(e) => {
-                log::error!("{}: write host socket: {e}", self.name);
+                log::error!("{}: write host stream: {e}", self.name);
                 0
             }
         };
-        if !conn.pending.is_empty() {
-            let token = Token(conn.reader.as_raw_fd() as usize);
-            let _ = registry.reregister(
-                &mut SourceFd(&conn.reader.as_raw_fd()),
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            );
-        }
+        // if the pipe filled up, the host read side will wake us when it drains
         if let ConnState::Established { fwd_cnt } = &mut conn.state {
             *fwd_cnt += Wrapping(flushed as u32);
         }
@@ -546,7 +505,6 @@ impl InProcessVsock {
         &mut self,
         host_port: u32,
         guest_port: u32,
-        registry: &Registry,
         rx_q: &mut Queue<'_, 'm, Q>,
         irq_sender: &S,
     ) -> Result<()>
@@ -594,12 +552,12 @@ impl InProcessVsock {
             }
             .to_bytes();
             let name = &self.name;
-            let reader = &mut conn.reader;
+            let pipe = &mut conn.pipe;
             rx_q.handle_desc(QUEUE_RX, irq_sender, |desc| {
                 if send_shutdown {
                     return Ok(Status::Break);
                 }
-                let (nread, eof, fits) = fill_rx_bufs(&mut desc.writable, reader, name)?;
+                let (nread, eof, fits) = fill_rx_bufs(&mut desc.writable, pipe, name)?;
                 if !fits {
                     log::error!("{name}: no buffer space for RW");
                     return Ok(Status::Break);
@@ -633,7 +591,44 @@ impl InProcessVsock {
                 "{}: vm:{guest_port} -> host:{host_port}: host eof, shutdown",
                 self.name
             );
-            let _ = self.remove_conn(host_port, guest_port, registry);
+            let _ = self.remove_conn(host_port, guest_port);
+        }
+        Ok(())
+    }
+
+    /// Re-examines every connection after the host side changed state
+    /// (notifier wake) or the guest posted new RX buffers: flush pending
+    /// guest data into the pipe and move pipe data into guest buffers.
+    fn service_connections<'m, Q, S>(
+        &mut self,
+        rx_q: &mut Queue<'_, 'm, Q>,
+        irq_sender: &S,
+    ) -> Result<()>
+    where
+        Q: VirtQueue<'m>,
+        S: IrqSender,
+    {
+        let keys: Vec<(u32, u32)> = self.connections.keys().copied().collect();
+        for (host_port, guest_port) in keys {
+            let mut credit = false;
+            if let Some(conn) = self.connections.get_mut(&(host_port, guest_port))
+                && !conn.pending.is_empty()
+            {
+                match flush_pending(conn) {
+                    Ok(n) => credit = n > 0 && conn.pending.is_empty(),
+                    Err(e) => log::error!("{}: write host stream: {e}", self.name),
+                }
+            }
+            if credit {
+                self.send_credit_update(host_port, guest_port, irq_sender, rx_q)?;
+            }
+            let ready = self
+                .connections
+                .get(&(host_port, guest_port))
+                .is_some_and(|conn| conn.pipe.is_readable());
+            if ready {
+                self.transfer_rx_data(host_port, guest_port, rx_q, irq_sender)?;
+            }
         }
         Ok(())
     }
@@ -671,7 +666,7 @@ fn gather<const N: usize>(bufs: &[IoSlice]) -> Option<[u8; N]> {
 
 fn fill_rx_bufs(
     bufs: &mut [IoSliceMut],
-    reader: &mut UnixStream,
+    pipe: &mut PipeDevEnd,
     name: &Arc<str>,
 ) -> io::Result<(usize, bool, bool)> {
     let mut skip = HDR_SIZE;
@@ -691,7 +686,7 @@ fn fill_rx_bufs(
         if eof {
             break;
         }
-        match reader.read(&mut buf[off..]) {
+        match pipe.read_slice(&mut buf[off..]) {
             Ok(0) => {
                 eof = true;
                 break;
@@ -704,7 +699,7 @@ fn fill_rx_bufs(
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => {
-                log::error!("{name}: read host socket: {e}");
+                log::error!("{name}: read host stream: {e}");
                 break;
             }
         }
@@ -750,13 +745,18 @@ impl VirtioMio for InProcessVsock {
     fn activate<'m, Q, S, E>(
         &mut self,
         _feature: u128,
-        _active_mio: &mut ActiveMio<'_, '_, 'm, Q, S, E>,
+        active_mio: &mut ActiveMio<'_, '_, 'm, Q, S, E>,
     ) -> Result<()>
     where
         Q: VirtQueue<'m>,
         S: IrqSender,
         E: IoeventFd,
     {
+        let registry = active_mio.poll.registry();
+        let mut notifier = self.notifier.lock().unwrap();
+        if let Err(e) = registry.register(&mut *notifier, Token(TOKEN_NOTIFY), Interest::READABLE) {
+            log::error!("{}: failed to register notifier: {e}", self.name);
+        }
         Ok(())
     }
 
@@ -770,46 +770,16 @@ impl VirtioMio for InProcessVsock {
         S: IrqSender,
         E: IoeventFd,
     {
-        let token = event.token();
-        let registry = active_mio.poll.registry();
-        let irq_sender = active_mio.irq_sender;
+        if event.token() != Token(TOKEN_NOTIFY) {
+            log::error!("{}: unexpected token {:?}", self.name, event.token());
+            return Ok(());
+        }
         let Some(Some(rx_q)) = active_mio.queues.get_mut(QUEUE_RX as usize) else {
             log::error!("{}: rx queue not ready", self.name);
             return Ok(());
         };
-        if let Some(&(host_port, guest_port)) = self.ports.get(&token) {
-            let mut credit = false;
-            if event.is_writable() {
-                if let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) {
-                    if let Err(e) = flush_pending(conn) {
-                        log::error!("{}: write host socket: {e}", self.name);
-                    }
-                    credit = conn.pending.is_empty();
-                    if credit {
-                        if let ConnState::Established { .. } = conn.state {
-                            let _ = registry.reregister(
-                                &mut SourceFd(&conn.reader.as_raw_fd()),
-                                token,
-                                Interest::READABLE,
-                            );
-                        }
-                    }
-                }
-            }
-            if credit || event.is_readable() {
-                if credit {
-                    self.send_credit_update(host_port, guest_port, irq_sender, rx_q)?;
-                }
-                if event.is_readable() {
-                    return self
-                        .transfer_rx_data(host_port, guest_port, registry, rx_q, irq_sender);
-                }
-            }
-            Ok(())
-        } else {
-            log::error!("{}: invalid token: {token:#?}", self.name);
-            Ok(())
-        }
+        let irq_sender = active_mio.irq_sender;
+        self.service_connections(rx_q, irq_sender)
     }
 
     fn handle_queue<'m, Q, S, E>(
@@ -828,11 +798,10 @@ impl VirtioMio for InProcessVsock {
                     log::error!("{}: queues not ready", self.name);
                     return Ok(());
                 };
-                let registry = active_mio.poll.registry();
                 let irq_sender = active_mio.irq_sender;
                 let name: Arc<str> = self.name.clone();
                 tx_q.handle_desc(QUEUE_TX, irq_sender, |desc| {
-                    if let Err(e) = self.handle_tx_desc(desc, registry, irq_sender, rx_q) {
+                    if let Err(e) = self.handle_tx_desc(desc, irq_sender, rx_q) {
                         log::error!("{name}: handle tx: {e:?}");
                         return Ok(Status::Break);
                     }
@@ -840,20 +809,23 @@ impl VirtioMio for InProcessVsock {
                 })?;
                 Ok(())
             }
-            QUEUE_RX | 2 => {
+            QUEUE_RX => {
                 log::debug!("{}: queue {index} buffer available", self.name);
-                Ok(())
+                // the guest posted RX buffers: data may have been waiting
+                let Some(Some(rx_q)) = active_mio.queues.get_mut(QUEUE_RX as usize) else {
+                    return Ok(());
+                };
+                let irq_sender = active_mio.irq_sender;
+                self.service_connections(rx_q, irq_sender)
             }
             _ => Ok(()),
         }
     }
 
     fn reset(&mut self, registry: &Registry) {
-        for (_, conn) in self.connections.drain() {
-            if let Err(err) = registry.deregister(&mut SourceFd(&conn.reader.as_raw_fd())) {
-                log::error!("{}: failed to deregister socket: {err}", self.name);
-            }
+        self.connections.clear();
+        if let Err(e) = registry.deregister(&mut *self.notifier.lock().unwrap()) {
+            log::debug!("{}: failed to deregister notifier: {e}", self.name);
         }
-        self.ports.clear();
     }
 }
