@@ -868,6 +868,7 @@ dependencies = [
  "log",
  "mio",
  "nar-to-erofs",
+ "nix",
  "nix-cache",
  "nix-drv",
  "oci-spec",

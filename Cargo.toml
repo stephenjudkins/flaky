@@ -25,7 +25,7 @@ futures = "0.3"
 libc = "0.2"
 log = "0.4"
 mio = "1.2.2"
-nix = { version = "0.31", features = ["fs", "mount", "reboot"] }
+nix = { version = "0.31", features = ["fs", "mount", "reboot", "socket"] }
 oci-spec = "0.10"
 pid1 = "0.1"
 postcard = { version = "1", default-features = false, features = ["use-std", "alloc"] }

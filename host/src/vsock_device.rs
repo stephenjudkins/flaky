@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write};
 use std::num::Wrapping;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -101,56 +101,25 @@ impl Hdr {
     }
 }
 
-fn set_flags(fd: RawFd) -> io::Result<()> {
-    unsafe {
-        let fl = libc::fcntl(fd, libc::F_GETFL);
-        if fl < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
-        if fd_flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let buf: libc::c_int = 1 << 21;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &buf as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-    Ok(())
-}
-
 fn socketpair() -> io::Result<(UnixStream, UnixStream)> {
-    let mut fds = [0 as RawFd; 2];
-    unsafe {
-        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) < 0 {
-            return Err(io::Error::last_os_error());
-        }
+    use nix::fcntl::{F_SETFD, FdFlag, fcntl};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, setsockopt, sockopt};
+    // SOCK_NONBLOCK/SOCK_CLOEXEC aren't supported by darwin socketpair(2)
+    let (a, b) = nix::sys::socket::socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )?;
+    let mut streams = [UnixStream::from(a), UnixStream::from(b)];
+    for s in &mut streams {
+        s.set_nonblocking(true)?;
+        fcntl(&*s, F_SETFD(FdFlag::FD_CLOEXEC))?;
+        setsockopt(&*s, sockopt::SndBuf, &(1 << 21))?;
+        setsockopt(&*s, sockopt::RcvBuf, &(1 << 21))?;
     }
-    set_flags(fds[0])?;
-    set_flags(fds[1])?;
-    Ok(unsafe {
-        (
-            UnixStream::from_raw_fd(fds[0]),
-            UnixStream::from_raw_fd(fds[1]),
-        )
-    })
+    let [a, b] = streams;
+    Ok((a, b))
 }
 
 #[derive(Debug)]
