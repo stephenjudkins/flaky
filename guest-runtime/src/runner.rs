@@ -52,13 +52,11 @@ async fn run_nix(nix_root: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("spawning nix: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    println!(
-        "guest: nix {}: exited with {:?}, stdout {stdout:?}, stderr {stderr:?}",
-        args[0],
-        out.status.code()
-    );
     match out.status.code() {
-        Some(0) => Ok(stdout),
+        Some(0) => {
+            println!("guest: nix {}: ok", args[0]);
+            Ok(stdout)
+        }
         code => Err(format!("nix {} exited with {code:?}: {stderr}", args[0])),
     }
 }

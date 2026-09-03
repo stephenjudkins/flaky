@@ -44,7 +44,7 @@ impl VmSpec {
             blk,
             kernel: PathBuf::from("guest/vmlinux.bin"),
             initramfs: PathBuf::from("guest/initramfs.cpio.gz"),
-            cmdline: "console=ttyAMA0 rdinit=/init".to_string(),
+            cmdline: "console=ttyAMA0 quiet rdinit=/init".to_string(),
             src_dir: None,
         }
     }

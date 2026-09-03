@@ -102,7 +102,6 @@ pub(crate) fn bind_from_image(image_root: &Path, store_path: &str) -> std::io::R
     let md = fs::symlink_metadata(&src)?;
     if md.file_type().is_symlink() {
         let target = fs::read_link(&src)?;
-        println!("guest: symlink {store_path} -> {}", target.display());
         let _ = fs::remove_file(dst);
         std::os::unix::fs::symlink(&target, dst)?;
         return Ok(());
@@ -116,7 +115,6 @@ pub(crate) fn bind_from_image(image_root: &Path, store_path: &str) -> std::io::R
             .mode(0o644)
             .open(dst)?;
     }
-    println!("guest: bind {} -> {}", src.display(), dst.display());
     mount_bind(&src, dst)
 }
 
