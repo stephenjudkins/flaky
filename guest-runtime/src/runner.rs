@@ -2,7 +2,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::builder::{bind_from_image, mount_base, mount_fs, mount_image_files};
+use crate::builder::{
+    IMAGE_DIR, bind_from_image, mount_base, mount_err, mount_fs, mount_image_files,
+};
 
 fn setup_nix(image: &str) -> std::io::Result<()> {
     mount_base()?;
@@ -73,4 +75,61 @@ pub async fn nix_eval(image: String, nix_root: String, expr: String) -> Result<S
     fs::create_dir_all("/tmp").map_err(|e| format!("setup: {e}"))?;
     fs::write("/tmp/expr.nix", &expr).map_err(|e| format!("setup: {e}"))?;
     run_nix(&nix_root, &["eval", "--file", "/tmp/expr.nix"]).await
+}
+
+pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
+    println!(
+        "guest: flake_eval request (attr {}, {} inputs)",
+        req.attr,
+        req.inputs.len()
+    );
+    setup_nix(&req.nix_image).map_err(|e| format!("setup: {e}"))?;
+    fs::create_dir_all("/nix/var/nix").map_err(|e| format!("setup: {e}"))?;
+    fs::create_dir_all("/tmp").map_err(|e| format!("setup: {e}"))?;
+
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    for inp in &req.inputs {
+        let vol = apis::volume_id(&inp.store_path);
+        let mnt = Path::new("/inputs").join(&vol);
+        fs::create_dir_all(&mnt).map_err(|e| format!("setup: {e}"))?;
+        mount_fs(&Path::new(IMAGE_DIR).join(&inp.image), &mnt, "erofs", true)
+            .map_err(|e| format!("setup: {e}"))?;
+        overrides.push((
+            inp.name.clone(),
+            mnt.join(nix_drv::basename(&inp.store_path))
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+    println!("guest: mounted {} flake inputs", overrides.len());
+
+    fs::create_dir_all("/flake").map_err(|e| format!("setup: {e}"))?;
+    mount_err(
+        nix::mount::mount(
+            Some("flaky-src"),
+            "/flake",
+            Some("virtiofs"),
+            nix::mount::MsFlags::MS_RDONLY
+                | nix::mount::MsFlags::MS_NODEV
+                | nix::mount::MsFlags::MS_NOSUID,
+            None::<&str>,
+        ),
+        "mount virtiofs flaky-src on /flake",
+    )
+    .map_err(|e| format!("setup: {e}"))?;
+
+    let mut args: Vec<String> = vec![
+        "--offline".into(),
+        "derivation".into(),
+        "show".into(),
+        "-r".into(),
+    ];
+    for (name, path) in &overrides {
+        args.push("--override-input".into());
+        args.push(name.clone());
+        args.push(path.clone());
+    }
+    args.push(format!("/flake#{}", req.attr));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_nix(&req.nix_root, &arg_refs).await
 }

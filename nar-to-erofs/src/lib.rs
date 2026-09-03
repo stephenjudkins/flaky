@@ -115,6 +115,10 @@ impl<R: AsyncRead + Unpin> NarDecoder<R> {
         }
     }
 
+    pub fn into_inner(self) -> R {
+        self.src
+    }
+
     /// Returns the next entry, or `None` at end of archive.
     pub async fn next_entry(&mut self) -> Result<Option<Entry>> {
         loop {
@@ -419,7 +423,7 @@ fn join(prefix: Option<&str>, path: &str) -> Result<String> {
 /// A regular file at the NAR root can only be written when `prefix` is set;
 /// it then lands at `prefix` itself.
 pub async fn write_nar<R, W>(
-    mut nar: NarDecoder<R>,
+    nar: &mut NarDecoder<R>,
     writer: &mut Writer<W>,
     prefix: Option<&str>,
 ) -> Result<()>
@@ -468,7 +472,8 @@ where
     W: AsyncWrite + AsyncSeek + Unpin + Send,
 {
     let mut writer = image_writer(sink, "").await?;
-    write_nar(NarDecoder::new(src), &mut writer, prefix).await?;
+    let mut nar = NarDecoder::new(src);
+    write_nar(&mut nar, &mut writer, prefix).await?;
     let sink = writer.finish().await?;
     Ok(sink.into_inner())
 }

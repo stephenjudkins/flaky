@@ -2,6 +2,9 @@
 members = ["host", "guest-runtime", "apis", "nar-to-erofs", "nix-cache", "nix-drv"]
 resolver = "3"
 
+[patch.crates-io]
+alioth = { path = "../alioth/alioth" }
+
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 erofs-builder = "0.1"
 flate2 = "1"
+flume = "0.12"
 futures = "0.3"
 libc = "0.2"
 log = "0.4"

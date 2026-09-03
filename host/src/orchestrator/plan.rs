@@ -81,6 +81,9 @@ pub(super) async fn plan<'a>(
         }
     }
     println!("build: {} images cached from earlier runs", images.len());
+    for (p, img) in &opts.extra_images {
+        images.entry(p.clone()).or_insert_with(|| img.clone());
+    }
 
     let mut ctx = Ctx {
         drvs,

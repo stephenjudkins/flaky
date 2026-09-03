@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 mod fetchurl;
+mod flake;
 mod host_api;
 mod image_fs;
+mod nar;
 mod orchestrator;
 mod rpc;
 mod vm;
@@ -22,6 +24,14 @@ enum Cmd {
     /// Build a derivation from `nix derivation show -r` JSON
     Build {
         drv_json: PathBuf,
+        #[arg(long, default_value = "https://cache.nixos.org")]
+        cache: String,
+        #[arg(long, default_value = ".cache")]
+        cache_dir: PathBuf,
+    },
+    /// Build a flake attribute, evaluating it with nix in a guest VM
+    Flake {
+        flake_ref: String,
         #[arg(long, default_value = "https://cache.nixos.org")]
         cache: String,
         #[arg(long, default_value = ".cache")]
@@ -58,13 +68,28 @@ async fn async_main(cmd: Cmd) -> Result<()> {
             drv_json,
             cache,
             cache_dir,
-        } => orchestrator::run(orchestrator::BuildOpts {
-            drv_json,
-            cache_url: cache,
+        } => {
+            let text = std::fs::read_to_string(&drv_json)
+                .with_context(|| format!("reading {}", drv_json.display()))?;
+            orchestrator::run(orchestrator::BuildOpts {
+                drv_json: text,
+                cache_url: cache,
+                cache_dir,
+                extra_images: Default::default(),
+            })
+            .await
+            .map(|out_path| println!("built: {out_path}"))
+        }
+        Cmd::Flake {
+            flake_ref,
+            cache,
             cache_dir,
-        })
-        .await
-        .map(|out_path| println!("built: {out_path}")),
+        } => {
+            let r = flake::parse_flake_ref(&flake_ref)?;
+            flake::run(r, cache, cache_dir)
+                .await
+                .map(|out_path| println!("built: {out_path}"))
+        }
         Cmd::NixVersion => nix_version().await,
         Cmd::NixEval { expr, file } => {
             let expr = match (expr, file) {
@@ -101,14 +126,15 @@ async fn nix_version() -> Result<()> {
     let version = vm
         .guest_rpc(|c| async move {
             c.nix_version(
-                apis::tarpc::context::current(),
+                crate::rpc::rpc_context(),
                 NIX_CLOSURE_IMAGE.to_string(),
                 root,
             )
             .await
+            .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))?
+            .map_err(anyhow::Error::msg)
         })
-        .await?
-        .map_err(anyhow::Error::msg)?;
+        .await?;
     vm.reap(std::time::Duration::from_secs(60)).await;
     println!("{version}");
     Ok(())
@@ -119,15 +145,16 @@ async fn nix_eval(expr: String) -> Result<()> {
     let result = vm
         .guest_rpc(|c| async move {
             c.nix_eval(
-                apis::tarpc::context::current(),
+                crate::rpc::rpc_context(),
                 NIX_CLOSURE_IMAGE.to_string(),
                 root,
                 expr,
             )
             .await
+            .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))?
+            .map_err(anyhow::Error::msg)
         })
-        .await?
-        .map_err(anyhow::Error::msg)?;
+        .await?;
     vm.reap(std::time::Duration::from_secs(60)).await;
     println!("{result}");
     Ok(())

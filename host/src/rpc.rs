@@ -10,6 +10,14 @@ use futures::prelude::*;
 
 pub type ByteStream = tokio::net::UnixStream;
 
+/// tarpc's `context::current()` defaults to a 10s request deadline;
+/// builds and evals run far longer than that.
+pub fn rpc_context() -> apis::tarpc::context::Context {
+    let mut ctx = apis::tarpc::context::current();
+    ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(6 * 3600);
+    ctx
+}
+
 type GuestApiCodec = Postcard<Response<GuestApiResponse>, ClientMessage<GuestApiRequest>>;
 pub type GuestApiTransport = Transport<
     ByteStream,

@@ -40,7 +40,6 @@
               path: type:
               nixpkgs.lib.hasPrefix "${toString ./guest-runtime}" path
               || nixpkgs.lib.hasPrefix "${toString ./apis}" path
-              || nixpkgs.lib.hasPrefix "${toString ./host}" path
               || nixpkgs.lib.hasPrefix "${toString ./nix-drv}" path
               || nixpkgs.lib.hasPrefix "${toString ./nar-to-erofs}" path
               || nixpkgs.lib.hasPrefix "${toString ./nix-cache}" path
@@ -55,6 +54,11 @@
             inherit src;
             buildAndTestSubdir = "guest-runtime";
             cargoLock.lockFile = ./Cargo.lock;
+            # the workspace patch points at a sibling checkout that does not
+            # exist in the sandbox; drop it (and the host member that needs it)
+            postPatch = ''
+              sed -i -e '/^\[patch\.crates-io\]/,/^alioth = /d' -e 's/members = \["host", /members = [/' Cargo.toml
+            '';
           };
           guest-kernel-base = pkgs.linux_latest.override {
             enableCommonConfig = false;

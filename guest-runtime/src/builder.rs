@@ -11,7 +11,7 @@ use nix::mount::{MsFlags, mount};
 use nix_drv::{generate_attrs_sh, structured_env};
 use tokio::io::AsyncRead;
 
-const IMAGE_DIR: &str = "/run/flaky-images";
+pub(crate) const IMAGE_DIR: &str = "/run/flaky-images";
 const IMAGE_TAG: &str = "flaky-images";
 
 pub(crate) fn mount_err<T>(r: nix::Result<T>, what: &str) -> std::io::Result<T> {
@@ -171,44 +171,72 @@ fn prepare_env(req: &BuildRequest) -> std::io::Result<Vec<(String, String)>> {
 
     let mut env: Vec<(String, String)> = Vec::new();
 
-    let mut json: Option<serde_json::Value> = None;
+    let mut attrs: Option<serde_json::Value> = None;
     for (k, v) in &req.env {
         if k == "__json" {
-            json = Some(serde_json::from_str(v).map_err(|e| {
+            attrs = Some(serde_json::from_str(v).map_err(|e| {
                 std::io::Error::other(format!("parsing __json for .attrs files: {e}"))
             })?);
         } else {
             env.push((k.clone(), v.clone()));
         }
     }
-    if let Some(attrs) = &json {
-        for (k, v) in structured_env(attrs) {
+    if attrs.is_none() {
+        if let Some(sa) = &req.structured_attrs {
+            attrs =
+                Some(serde_json::from_str(sa).map_err(|e| {
+                    std::io::Error::other(format!("parsing structured attrs: {e}"))
+                })?);
+        }
+    }
+    if let Some(attrsv) = &attrs {
+        for (k, v) in structured_env(attrsv) {
             set(&mut env, &k, &v);
         }
-        let raw = req
-            .env
-            .iter()
-            .find(|(k, _)| k == "__json")
-            .unwrap()
-            .1
-            .clone();
-        fs::write("/tmp/.attrs.json", &raw)?;
+        fs::write(
+            "/tmp/.attrs.json",
+            serde_json::to_string(attrsv).unwrap_or_default(),
+        )?;
         fs::set_permissions("/tmp/.attrs.json", fs::Permissions::from_mode(0o644))?;
         let outs: Vec<(String, String)> = req
             .outputs
             .iter()
             .map(|o| (o.name.clone(), o.store_path.clone()))
             .collect();
-        let sh = generate_attrs_sh(attrs, &outs);
+        let sh = generate_attrs_sh(attrsv, &outs);
         fs::write("/tmp/.attrs.sh", &sh)?;
         fs::set_permissions("/tmp/.attrs.sh", fs::Permissions::from_mode(0o644))?;
-        println!(
-            "guest: structured attrs: {} bytes json, {} bytes sh",
-            raw.len(),
-            sh.len()
-        );
         set(&mut env, "NIX_ATTRS_JSON_FILE", "/tmp/.attrs.json");
         set(&mut env, "NIX_ATTRS_SH_FILE", "/tmp/.attrs.sh");
+    }
+
+    // replicate nix's passAsFile handling: named vars are removed from the
+    // environment, written to /tmp/.attr-<name>, and <name>Path points at
+    // the file
+    let pass: Option<String> = env
+        .iter()
+        .find(|(k, _)| k == "passAsFile")
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            attrs
+                .as_ref()
+                .and_then(|a| a.get("passAsFile"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    if let Some(pass) = pass {
+        for name in pass.split_whitespace() {
+            let value = env
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            env.retain(|(k, _)| k != name);
+            let file = format!("/tmp/.attr-{}", name.replace(':', "-"));
+            fs::write(&file, value.as_bytes())?;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644))?;
+            set(&mut env, &format!("{name}Path"), &file);
+        }
     }
     let defaults: &[(&str, &str)] = &[
         ("NIX_STORE", "/nix/store"),
@@ -325,6 +353,43 @@ async fn pack_output(store_path: &str, dev: &Path) -> std::io::Result<u64> {
         writer
             .add_file(&format!("{base}/{base}"), meta, md.len(), &mut r)
             .await?;
+    }
+    let (file, size) = nar_to_erofs::finish_image(writer)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    file.sync_all().await?;
+    Ok(size)
+}
+
+/// Packs the given store paths as top-level entries of one erofs image
+/// onto `dev` (paths created by nix during flake eval, passed back to the
+/// host as build inputs).
+pub async fn pack_store_paths(paths: &[String], dev: &Path) -> std::io::Result<u64> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dev)
+        .await?;
+    let mut writer = nar_to_erofs::image_writer(file, "flake-inputs")
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    for p in paths {
+        let base = nix_drv::basename(p);
+        let path = Path::new(p);
+        let md = fs::symlink_metadata(path)?;
+        if md.is_dir() {
+            pack_dir(&mut writer, path, base).await?;
+        } else {
+            writer.mkdir(base, InodeMeta::dir(0o755)).await?;
+            let mut meta = InodeMeta::reg((md.mode() & 0o7777) as u16);
+            if md.mode() & 0o111 != 0 {
+                meta.mode = 0o100555;
+            }
+            let mut r = SyncReader(fs::File::open(path)?);
+            writer
+                .add_file(&format!("{base}/{base}"), meta, md.len(), &mut r)
+                .await?;
+        }
     }
     let (file, size) = nar_to_erofs::finish_image(writer)
         .await

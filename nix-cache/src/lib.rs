@@ -327,7 +327,8 @@ where
         inner: stream,
         n: n.clone(),
     };
-    nar_to_erofs::write_nar(NarDecoder::new(counting), writer, Some(prefix)).await?;
+    let mut decoder = NarDecoder::new(counting);
+    nar_to_erofs::write_nar(&mut decoder, writer, Some(prefix)).await?;
     let produced = n.load(std::sync::atomic::Ordering::SeqCst);
     if produced != nar.nar_size {
         return Err(Error::Narinfo(format!(

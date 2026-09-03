@@ -40,9 +40,8 @@ fn pad(n: u64) -> u64 {
     (8 - (n % 8)) % 8
 }
 
-fn expected_digest(env: &std::collections::BTreeMap<String, String>) -> anyhow::Result<[u8; 32]> {
-    let h = env
-        .get("outputHash")
+fn expected_digest(drv: &Derivation) -> anyhow::Result<[u8; 32]> {
+    let h = nix_drv::env_value(drv, "outputHash")
         .ok_or_else(|| anyhow!("fetchurl drv without outputHash"))?;
     if let Some(b64) = h.strip_prefix("sha256-") {
         let v = base64::engine::general_purpose::STANDARD
@@ -203,20 +202,14 @@ pub async fn realize_to_image(
     dest: &Path,
     scratch_dir: &Path,
 ) -> anyhow::Result<u64> {
-    let env = &drv.env;
-    let out_path = env
-        .get("out")
-        .ok_or_else(|| anyhow!("fetchurl drv without out"))?;
-    let base = nix_drv::basename(out_path).to_string();
-    let mode = env
-        .get("outputHashMode")
-        .map(|s| s.as_str())
-        .unwrap_or("flat");
-    let executable = env.get("executable").map_or(false, |v| v == "1");
-    let expected = expected_digest(env)?;
-    let urls: Vec<String> = env
-        .get("urls")
-        .or_else(|| env.get("url"))
+    let out_path =
+        nix_drv::env_value(drv, "out").ok_or_else(|| anyhow!("fetchurl drv without out"))?;
+    let base = nix_drv::basename(&out_path).to_string();
+    let mode = nix_drv::env_value(drv, "outputHashMode").unwrap_or_else(|| "flat".to_string());
+    let executable = nix_drv::env_value(drv, "executable").as_deref() == Some("1");
+    let expected = expected_digest(drv)?;
+    let urls: Vec<String> = nix_drv::env_value(drv, "urls")
+        .or_else(|| nix_drv::env_value(drv, "url"))
         .ok_or_else(|| anyhow!("fetchurl drv without url"))?
         .split_whitespace()
         .map(String::from)
@@ -245,7 +238,7 @@ pub async fn realize_to_image(
         None => return Err(last_err.unwrap()),
     };
 
-    let digest = digest_of_file(&tmp, mode, size, executable)
+    let digest = digest_of_file(&tmp, &mode, size, executable)
         .await
         .context("hashing fetchurl output")?;
     if digest != expected {
@@ -261,7 +254,7 @@ pub async fn realize_to_image(
     );
 
     let file = tokio::fs::File::create(dest).await?;
-    let mut writer = nar_to_erofs::image_writer(file, &apis::volume_id(out_path)).await?;
+    let mut writer = nar_to_erofs::image_writer(file, &apis::volume_id(&out_path)).await?;
 
     let reader = NarOfFile {
         file: tokio::fs::File::open(&tmp).await?,
@@ -272,20 +265,16 @@ pub async fn realize_to_image(
         padded: false,
         state: 0,
     };
-    nar_to_erofs::write_nar(
-        nar_to_erofs::NarDecoder::new(reader),
-        &mut writer,
-        Some(&base),
-    )
-    .await
-    .map_err(|e| anyhow!("writing fetchurl nar: {e}"))?;
+    let mut nar = nar_to_erofs::NarDecoder::new(reader);
+    nar_to_erofs::write_nar(&mut nar, &mut writer, Some(&base))
+        .await
+        .map_err(|e| anyhow!("writing fetchurl nar: {e}"))?;
     let (file, image_size) = nar_to_erofs::finish_image(writer).await?;
     file.set_len(image_size).await?;
     file.sync_all().await?;
     let _ = std::fs::remove_file(&tmp);
     Ok(image_size)
 }
-
 
 #[cfg(test)]
 mod tests;

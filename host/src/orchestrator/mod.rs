@@ -31,9 +31,14 @@ use nix_drv::{Closure, Derivations};
 const MAX_CONCURRENT_FETCHES: usize = 8;
 
 pub struct BuildOpts {
-    pub drv_json: PathBuf,
+    /// `nix derivation show -r` JSON text.
+    pub drv_json: String,
     pub cache_url: String,
     pub cache_dir: PathBuf,
+    /// Store paths realized outside the normal fetch/build flow (e.g.
+    /// sources created by nix during flake eval) -> the erofs image
+    /// containing them as top-level entries.
+    pub extra_images: BTreeMap<String, PathBuf>,
 }
 
 struct Plan {
@@ -65,6 +70,12 @@ fn image_path(opts: &BuildOpts, store_path: &str) -> PathBuf {
         .join(format!("{}.erofs", apis::store_hash(store_path)))
 }
 
+pub(crate) fn image_path_for(cache_dir: &std::path::Path, store_path: &str) -> PathBuf {
+    cache_dir
+        .join("erofs")
+        .join(format!("{}.erofs", apis::store_hash(store_path)))
+}
+
 fn producing_drv(closure: &Closure, drvs: &Derivations, path: &str) -> Option<String> {
     closure
         .drvs
@@ -74,9 +85,7 @@ fn producing_drv(closure: &Closure, drvs: &Derivations, path: &str) -> Option<St
 }
 
 pub async fn run(opts: BuildOpts) -> anyhow::Result<String> {
-    let text = std::fs::read_to_string(&opts.drv_json)
-        .with_context(|| format!("reading {}", opts.drv_json.display()))?;
-    let drvs = nix_drv::parse(&text).context("parsing derivation json")?;
+    let drvs = nix_drv::parse(&opts.drv_json).context("parsing derivation json")?;
     let root = nix_drv::find_root(&drvs).ok_or_else(|| anyhow!("no unique root derivation"))?;
     let closure = nix_drv::closure(&drvs, &root);
     let root_out: Option<String> = drvs[&root].outputs.values().next().map(|o| o.path.clone());
@@ -195,7 +204,6 @@ fn scan_store_paths(s: &str) -> Vec<String> {
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests;

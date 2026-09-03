@@ -99,6 +99,7 @@ pub(super) async fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Resu
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        structured_attrs: drv.structuredAttrs.as_ref().map(|v| v.to_string()),
         outputs: outputs
             .iter()
             .enumerate()
@@ -113,7 +114,11 @@ pub(super) async fn build_one(ctx: &mut Ctx<'_>, drv_path: &str) -> anyhow::Resu
 
     let vm = Vm::boot(VmSpec::guest(1024, 1, images, blk)).context("booting build vm")?;
     let result: apis::BuildResult = vm
-        .guest_rpc(|c| async move { c.build(apis::tarpc::context::current(), request).await })
+        .guest_rpc(|c| async move {
+            c.build(crate::rpc::rpc_context(), request)
+                .await
+                .map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
+        })
         .await
         .context("running build in vm")?;
     vm.reap(std::time::Duration::from_secs(60)).await;

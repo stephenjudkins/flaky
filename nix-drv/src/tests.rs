@@ -107,3 +107,91 @@ fn hex(s: &str) -> Vec<u8> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
         .collect()
 }
+
+#[test]
+fn source_store_path_matches_nix() {
+    // verified against `nix flake archive` for the samples flake.lock inputs
+    assert_eq!(
+        source_store_path("sha256-dt4WdcvsA8/RCe+VZZwqU0X+XMM3wBbGCWA0/sFWzGo="),
+        "/nix/store/d6mryll7gbj6hbczvyrvnflcyxxq11zn-source"
+    );
+    assert_eq!(
+        source_store_path("sha256-Mziif8w1I2tc2rL8g5ov0PrKzmVZaEvAEAZjsyyvdTk="),
+        "/nix/store/1c9r7jikgbcvh746pwvpp7652vr3zwsi-source"
+    );
+}
+
+#[test]
+fn parses_v4_derivation_show() {
+    // captured from `nix --offline derivation show -r` (nix 2.34, v4 format)
+    let text = r#"{
+  "derivations": {
+    "fxi28ig53ga2h6mavj21jfs6kkdsqzry-flaky-sample-write-file.drv": {
+      "args": ["-e", "/nix/store/l622p70vy8k5sh7y5wizi5f2mic6ynpg-source-stdenv.sh"],
+      "builder": "/nix/store/3kaakrwd1jia637aa3cpj3lkgfxwg3k3-bash-5.3p15/bin/bash",
+      "env": {"__structuredAttrs": "", "buildCommand": "mkdir $out", "out": "/nix/store/c72cyy4yl1ay0vkna42k79rcijnamqng-flaky-sample-write-file", "passAsFile": "buildCommand"},
+      "inputs": {
+        "drvs": {"gijz9fmbq78n1877ycpyxdks6d141w90-bootstrap-stage4-stdenv-linux.drv": {"dynamicOutputs": {}, "outputs": ["out"]}},
+        "srcs": ["l622p70vy8k5sh7y5wizi5f2mic6ynpg-source-stdenv.sh", "shkw4qm9qcw5sc5n1k5jznc83ny02r39-default-builder.sh"]
+      },
+      "name": "flaky-sample-write-file",
+      "outputs": {"out": {"path": "c72cyy4yl1ay0vkna42k79rcijnamqng-flaky-sample-write-file"}},
+      "system": "aarch64-linux",
+      "version": 4
+    }
+  },
+  "version": 4
+}"#;
+    let drvs = parse(text).unwrap();
+    let key = "/nix/store/fxi28ig53ga2h6mavj21jfs6kkdsqzry-flaky-sample-write-file.drv";
+    assert_eq!(drvs.len(), 1);
+    let d = &drvs[key];
+    assert_eq!(d.name, "flaky-sample-write-file");
+    assert_eq!(
+        d.outputs["out"].path,
+        "/nix/store/c72cyy4yl1ay0vkna42k79rcijnamqng-flaky-sample-write-file"
+    );
+    assert_eq!(
+        d.inputSrcs,
+        vec![
+            "/nix/store/l622p70vy8k5sh7y5wizi5f2mic6ynpg-source-stdenv.sh".to_string(),
+            "/nix/store/shkw4qm9qcw5sc5n1k5jznc83ny02r39-default-builder.sh".to_string()
+        ]
+    );
+    assert_eq!(
+        d.inputDrvs.keys().next().map(String::as_str),
+        Some("/nix/store/gijz9fmbq78n1877ycpyxdks6d141w90-bootstrap-stage4-stdenv-linux.drv")
+    );
+}
+
+#[test]
+fn parses_v4_structured_attrs_fetchurl() {
+    let text = r#"{
+  "derivations": {
+    "0p57d8lpv8i125pn7xp7h1jhjpx4xf7c-Compress-Raw-Zlib-2.222.tar.gz.drv": {
+      "args": ["builtin:fetchurl"],
+      "builder": "builtin:fetchurl",
+      "env": {"out": "/nix/store/gmrhyy2xvh667zsvjgiv00kj7y6ca8nc-lzip-1.26.tar.gz"},
+      "inputs": {"drvs": {}, "srcs": []},
+      "name": "lzip-1.26.tar.gz",
+      "outputs": {"out": {"hash": "sha256-ZBzzCWFSXL47NAzIg0NsiFTp9QMvRZ9ETeR4K2IeZXI=", "method": "flat", "path": "gmrhyy2xvh667zsvjgiv00kj7y6ca8nc-lzip-1.26.tar.gz"}},
+      "structuredAttrs": {"executable": false, "outputHash": "sha256-ZBzzCWFSXL47NAzIg0NsiFTp9QMvRZ9ETeR4K2IeZXI=", "outputHashAlgo": "sha256", "outputHashMode": "flat", "urls": ["https://example.com/lzip-1.26.tar.gz"]},
+      "system": "builtin",
+      "version": 4
+    }
+  },
+  "version": 4
+}"#;
+    let drvs = parse(text).unwrap();
+    let d = &drvs["/nix/store/0p57d8lpv8i125pn7xp7h1jhjpx4xf7c-Compress-Raw-Zlib-2.222.tar.gz.drv"];
+    assert_eq!(
+        env_value(d, "outputHash").as_deref(),
+        Some("sha256-ZBzzCWFSXL47NAzIg0NsiFTp9QMvRZ9ETeR4K2IeZXI=")
+    );
+    assert_eq!(
+        env_value(d, "urls").as_deref(),
+        Some("https://example.com/lzip-1.26.tar.gz")
+    );
+    assert_eq!(env_value(d, "executable").as_deref(), Some(""));
+    assert_eq!(d.builder, "builtin:fetchurl");
+}

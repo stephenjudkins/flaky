@@ -13,7 +13,7 @@ use alioth::fuse::bindings::{
     FuseOpenOut, FuseReadIn, FuseReleaseIn,
 };
 use alioth::fuse::{DaxRegion, Fuse};
-use alioth::virtio::dev::DevParam;
+use alioth::virtio::dev::DevSpec;
 use alioth::virtio::dev::fs::{Fs, FsConfig};
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
@@ -273,7 +273,7 @@ pub struct ImageFilesParam {
     pub files: Vec<ImageFile>,
 }
 
-impl DevParam for ImageFilesParam {
+impl DevSpec for ImageFilesParam {
     type Device = Fs<ImageFiles>;
 
     fn build(self, name: impl Into<Arc<str>>) -> Result<Self::Device, alioth::virtio::Error> {
@@ -293,7 +293,6 @@ impl DevParam for ImageFilesParam {
         Fs::new(name, filesystem, config, 0)
     }
 }
-
 
 #[cfg(test)]
 mod tests;

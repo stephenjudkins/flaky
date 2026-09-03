@@ -1,14 +1,16 @@
-use std::ffi::CString;
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alioth::board::{BoardConfig, CpuConfig};
+use alioth::board::{BoardSpec, CpuSpec, CpuTopology};
+use alioth::fuse::passthrough::Passthrough;
 use alioth::hv::Hvf;
-use alioth::loader::{Executable, Payload};
-use alioth::mem::{MemBackend, MemConfig};
-use alioth::virtio::dev::blk::BlkFileParam;
-use alioth::virtio::dev::entropy::EntropyParam;
+use alioth::loader::{Executable, PayloadSpec};
+use alioth::mem::{MemBackend, MemSpec};
+use alioth::virtio::dev::DevSpec;
+use alioth::virtio::dev::blk::BlkFileSpec;
+use alioth::virtio::dev::entropy::EntropySpec;
+use alioth::virtio::dev::fs::{Fs, FsConfig};
 use alioth::virtio::worker::WorkerApi;
 use alioth::vm::Machine;
 use anyhow::Context as _;
@@ -29,6 +31,8 @@ pub struct VmSpec {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
     pub cmdline: String,
+    /// Host directory exposed read-only via a `flaky-src` virtio-fs device.
+    pub src_dir: Option<PathBuf>,
 }
 
 impl VmSpec {
@@ -41,7 +45,33 @@ impl VmSpec {
             kernel: PathBuf::from("guest/vmlinux.bin"),
             initramfs: PathBuf::from("guest/initramfs.cpio.gz"),
             cmdline: "console=ttyAMA0 rdinit=/init".to_string(),
+            src_dir: None,
         }
+    }
+}
+
+const SRC_TAG: &str = "flaky-src";
+
+struct DirFsParam {
+    path: PathBuf,
+}
+
+impl DevSpec for DirFsParam {
+    type Device = Fs<Passthrough>;
+
+    fn build(
+        self,
+        name: impl Into<std::sync::Arc<str>>,
+    ) -> Result<Self::Device, alioth::virtio::Error> {
+        let filesystem = Passthrough::new(self.path.into_boxed_path())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut config = FsConfig {
+            tag: [0; 36],
+            num_request_queues: 1,
+            notify_buf_size: 0,
+        };
+        config.tag[..SRC_TAG.len()].copy_from_slice(SRC_TAG.as_bytes());
+        Fs::new(name, filesystem, config, 0)
     }
 }
 
@@ -58,21 +88,25 @@ impl Vm {
         let hv = Hvf {};
         let vm = Machine::new(
             &hv,
-            BoardConfig {
-                mem: MemConfig {
+            BoardSpec {
+                mem: MemSpec {
                     size: spec.mem_mib << 20,
                     backend: MemBackend::Anonymous,
                     ..Default::default()
                 },
-                cpu: CpuConfig {
+                cpu: CpuSpec {
                     count: spec.cpus,
-                    ..Default::default()
+                    topology: CpuTopology {
+                        sockets: 1,
+                        cores: spec.cpus,
+                        ..Default::default()
+                    },
                 },
                 coco: None,
             },
         )?;
 
-        vm.add_pl011()?;
+        vm.add_pl011(&alioth::device::console::ConsoleSpec::Stdio)?;
         vm.add_pl031();
 
         vm.add_virtio_dev(
@@ -85,7 +119,7 @@ impl Vm {
         for (i, dev) in spec.blk.iter().enumerate() {
             vm.add_virtio_dev(
                 format!("virtio-blk-{i}"),
-                BlkFileParam {
+                BlkFileSpec {
                     path: dev.path.clone().into(),
                     readonly: dev.readonly,
                     api: WorkerApi::Mio,
@@ -93,13 +127,16 @@ impl Vm {
             )
             .with_context(|| format!("adding output block device {i}"))?;
         }
-        vm.add_virtio_dev("virtio-rng", EntropyParam::default())?;
+        if let Some(dir) = &spec.src_dir {
+            vm.add_virtio_dev("virtio-fs-src", DirFsParam { path: dir.clone() })?;
+        }
+        vm.add_virtio_dev("virtio-rng", EntropySpec::default())?;
         let (vsock_param, vsock_host) = VsockParam::new(3);
         vm.add_virtio_dev("virtio-vsock", vsock_param)?;
 
-        vm.add_payload(Payload {
+        vm.add_payload(PayloadSpec {
             executable: Some(Executable::Linux(spec.kernel.into())),
-            cmdline: Some(CString::new(spec.cmdline).unwrap()),
+            cmdline: Some(spec.cmdline.into_boxed_str()),
             initramfs: Some(spec.initramfs.into()),
             firmware: None,
         });
@@ -113,12 +150,13 @@ impl Vm {
     }
 
     /// Accepts the guest's vsock connections, serves the host API
-    /// (logging), and performs one RPC against the guest. `f` receives
-    /// the tarpc client and returns the in-flight request future.
+    /// (logging), and performs RPCs against the guest. `f` receives the
+    /// tarpc client and returns the in-flight request future; it may issue
+    /// multiple sequential RPCs.
     pub async fn guest_rpc<T, F, Fut>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(crate::rpc::GuestApiClient) -> Fut,
-        Fut: Future<Output = std::result::Result<T, apis::tarpc::client::RpcError>>,
+        Fut: Future<Output = anyhow::Result<T>>,
     {
         let guest_api_stream = tokio::net::UnixStream::from_std(
             tokio::time::timeout(
@@ -140,9 +178,7 @@ impl Vm {
         let host_api = crate::rpc::serve_host_api(host_api_stream, crate::host_api::HostApiServer);
         tokio::pin!(host_api);
         let result = tokio::select! {
-            r = conn.drive(|c| async move {
-                f(c).await.map_err(|e| anyhow::anyhow!("guest rpc: {e}"))
-            }) => r,
+            r = conn.drive(f) => r,
             _ = &mut host_api => anyhow::bail!("host api server terminated"),
         };
         // always ask the guest to power off so vm.wait() completes

@@ -3,7 +3,6 @@ use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write};
 use std::num::Wrapping;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -11,10 +10,11 @@ use alioth::hv::IoeventFd;
 use alioth::mem::mapped::RamBus;
 use alioth::sync::notifier::Notifier;
 use alioth::virtio::dev::vsock::{VsockConfig, VsockFeature};
-use alioth::virtio::dev::{DevParam, Virtio, WakeEvent};
+use alioth::virtio::dev::{DevSpec, Virtio, WakeEvent};
 use alioth::virtio::queue::{DescChain, Queue, QueueReg, Status, VirtQueue};
 use alioth::virtio::worker::mio::{ActiveMio, Mio, VirtioMio};
 use alioth::virtio::{DeviceId, IrqSender, VirtioFeature};
+use flume::Receiver;
 use mio::event::Event;
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
@@ -117,6 +117,21 @@ fn set_flags(fd: RawFd) -> io::Result<()> {
         if libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
             return Err(io::Error::last_os_error());
         }
+        let buf: libc::c_int = 1 << 21;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
     Ok(())
 }
@@ -149,6 +164,7 @@ struct Connection {
     state: ConnState,
     reader: UnixStream,
     writer: UnixStream,
+    pending: Vec<u8>,
 }
 
 impl Connection {
@@ -159,8 +175,25 @@ impl Connection {
             },
             writer: stream.try_clone()?,
             reader: stream,
+            pending: Vec::new(),
         })
     }
+}
+
+fn flush_pending(conn: &mut Connection) -> io::Result<usize> {
+    let mut total = 0usize;
+    while !conn.pending.is_empty() {
+        match conn.writer.write(&conn.pending) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                conn.pending.drain(..n);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Default)]
@@ -216,7 +249,7 @@ impl VsockParam {
     }
 }
 
-impl DevParam for VsockParam {
+impl DevSpec for VsockParam {
     type Device = InProcessVsock;
 
     fn build(self, name: impl Into<Arc<str>>) -> Result<Self::Device> {
@@ -365,6 +398,37 @@ impl InProcessVsock {
         self.respond(&rst, irq_sender, rx_q)
     }
 
+    fn send_credit_update<'m, Q, S>(
+        &mut self,
+        host_port: u32,
+        guest_port: u32,
+        irq_sender: &S,
+        rx_q: &mut Queue<'_, 'm, Q>,
+    ) -> Result<()>
+    where
+        Q: VirtQueue<'m>,
+        S: IrqSender,
+    {
+        let Some(conn) = self.connections.get(&(host_port, guest_port)) else {
+            return Ok(());
+        };
+        let ConnState::Established { fwd_cnt } = conn.state else {
+            return Ok(());
+        };
+        let update = Hdr {
+            src_cid: CID_HOST,
+            dst_cid: self.guest_cid,
+            src_port: host_port,
+            dst_port: guest_port,
+            type_: TYPE_STREAM,
+            op: OP_CREDIT_UPDATE,
+            fwd_cnt: fwd_cnt.0,
+            buf_alloc: BUF_ALLOC,
+            ..Default::default()
+        };
+        self.respond(&update, irq_sender, rx_q)
+    }
+
     fn remove_conn(&mut self, host_port: u32, guest_port: u32, registry: &Registry) -> Result<()> {
         let Some(conn) = self.connections.remove(&(host_port, guest_port)) else {
             log::warn!(
@@ -433,18 +497,24 @@ impl InProcessVsock {
                 self.handle_tx_request(&hdr, registry, irq_sender, rx_q)?;
                 self.transfer_rx_data(hdr.dst_port, hdr.src_port, registry, rx_q, irq_sender)?;
             }
+            OP_RW => {
+                self.transfer_tx_data(&hdr, &desc.readable, registry)?;
+                self.send_credit_update(hdr.dst_port, hdr.src_port, irq_sender, rx_q)?;
+            }
             OP_RST => {
                 self.remove_conn(hdr.dst_port, hdr.src_port, registry)?;
             }
             OP_SHUTDOWN => self.handle_tx_shutdown(&hdr, registry)?,
-            OP_RW => self.transfer_tx_data(&hdr, &desc.readable)?,
-            OP_CREDIT_UPDATE | OP_CREDIT_REQUEST => {}
+            OP_CREDIT_UPDATE => {}
+            OP_CREDIT_REQUEST => {
+                self.send_credit_update(hdr.dst_port, hdr.src_port, irq_sender, rx_q)?;
+            }
             other => log::error!("{}: unsupported op {other}", self.name),
         }
         Ok(())
     }
 
-    fn transfer_tx_data(&mut self, hdr: &Hdr, bufs: &[IoSlice]) -> Result<()> {
+    fn transfer_tx_data(&mut self, hdr: &Hdr, bufs: &[IoSlice], registry: &Registry) -> Result<()> {
         let (host_port, guest_port) = (hdr.dst_port, hdr.src_port);
         let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) else {
             log::warn!(
@@ -453,7 +523,7 @@ impl InProcessVsock {
             );
             return Ok(());
         };
-        let ConnState::Established { fwd_cnt } = &mut conn.state else {
+        let ConnState::Established { .. } = conn.state else {
             log::warn!(
                 "{}: vm:{guest_port} -> host:{host_port}: invalid state",
                 self.name
@@ -476,16 +546,30 @@ impl InProcessVsock {
                 }
             }
             let n = remain.min(buf.len());
-            if let Err(e) = conn.writer.write_all(&buf[..n]) {
-                log::error!("{}: write host socket: {e}", self.name);
-                break;
-            }
+            conn.pending.extend_from_slice(&buf[..n]);
             remain -= n;
         }
         if remain > 0 {
             log::error!("{}: missing {remain} bytes", self.name);
         }
-        *fwd_cnt += Wrapping(hdr.len - remain as u32);
+        let flushed = match flush_pending(conn) {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("{}: write host socket: {e}", self.name);
+                0
+            }
+        };
+        if !conn.pending.is_empty() {
+            let token = Token(conn.reader.as_raw_fd() as usize);
+            let _ = registry.reregister(
+                &mut SourceFd(&conn.reader.as_raw_fd()),
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            );
+        }
+        if let ConnState::Established { fwd_cnt } = &mut conn.state {
+            *fwd_cnt += Wrapping(flushed as u32);
+        }
         Ok(())
     }
 
@@ -725,7 +809,34 @@ impl VirtioMio for InProcessVsock {
             return Ok(());
         };
         if let Some(&(host_port, guest_port)) = self.ports.get(&token) {
-            self.transfer_rx_data(host_port, guest_port, registry, rx_q, irq_sender)
+            let mut credit = false;
+            if event.is_writable() {
+                if let Some(conn) = self.connections.get_mut(&(host_port, guest_port)) {
+                    if let Err(e) = flush_pending(conn) {
+                        log::error!("{}: write host socket: {e}", self.name);
+                    }
+                    credit = conn.pending.is_empty();
+                    if credit {
+                        if let ConnState::Established { .. } = conn.state {
+                            let _ = registry.reregister(
+                                &mut SourceFd(&conn.reader.as_raw_fd()),
+                                token,
+                                Interest::READABLE,
+                            );
+                        }
+                    }
+                }
+            }
+            if credit || event.is_readable() {
+                if credit {
+                    self.send_credit_update(host_port, guest_port, irq_sender, rx_q)?;
+                }
+                if event.is_readable() {
+                    return self
+                        .transfer_rx_data(host_port, guest_port, registry, rx_q, irq_sender);
+                }
+            }
+            Ok(())
         } else {
             log::error!("{}: invalid token: {token:#?}", self.name);
             Ok(())
