@@ -1,4 +1,5 @@
-use super::{FlakeRef, lock_inputs, parse_flake_ref};
+use super::{FlakeRef, hash_flake_dir, lock_inputs, parse_flake_ref};
+use std::os::unix::fs::PermissionsExt as _;
 
 fn check(ref_: FlakeRef, dir: &str, attr: &str) {
     assert_eq!(ref_.dir, std::path::PathBuf::from(dir));
@@ -34,4 +35,37 @@ fn reads_samples_lock() {
         inputs[0].1.nar_hash,
         "sha256-dt4WdcvsA8/RCe+VZZwqU0X+XMM3wBbGCWA0/sFWzGo="
     );
+}
+
+#[test]
+fn flake_dir_hash_is_order_and_content_sensitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("flake.nix"), "{ }").unwrap();
+    std::fs::write(dir.join("flake.lock"), "{}").unwrap();
+    let base = hash_flake_dir(dir).unwrap();
+    assert_eq!(base, hash_flake_dir(dir).unwrap());
+
+    std::fs::write(dir.join("flake.nix"), "{ } ").unwrap();
+    assert_ne!(base, hash_flake_dir(dir).unwrap());
+
+    std::fs::write(dir.join("flake.nix"), "{ }").unwrap();
+    std::fs::set_permissions(
+        dir.join("flake.nix"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert_ne!(base, hash_flake_dir(dir).unwrap());
+
+    std::fs::set_permissions(
+        dir.join("flake.nix"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("flake.nix", dir.join("link")).unwrap();
+    assert_ne!(base, hash_flake_dir(dir).unwrap());
+    assert_eq!(base, {
+        std::fs::remove_file(dir.join("link")).unwrap();
+        hash_flake_dir(dir).unwrap()
+    });
 }

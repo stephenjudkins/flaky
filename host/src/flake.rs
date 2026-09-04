@@ -12,10 +12,12 @@
 //! packed by the guest into one extra image and bound into build VMs.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::image_fs::ImageFile;
 use crate::nar::{DirNar, HashReader};
@@ -187,6 +189,148 @@ fn prep_scratch(path: &Path, size: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hex(d: [u8; 32]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<String> {
+    let mut h = Sha256::new();
+    let mut f = std::fs::File::open(path)?;
+    std::io::copy(&mut f, &mut HashWriter(&mut h))?;
+    Ok(hex(h.finalize().into()))
+}
+
+/// Content hash of the flake's own source tree. Names cannot contain NUL,
+/// so NUL-termination is unambiguous; the executable bit participates
+/// because it affects the store paths nix assigns during eval.
+fn hash_flake_dir(dir: &Path) -> anyhow::Result<String> {
+    fn walk(h: &mut Sha256, dir: &Path, prefix: &[u8]) -> anyhow::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let rel = [prefix, e.file_name().as_encoded_bytes()].concat();
+            let md = std::fs::symlink_metadata(e.path())?;
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                h.update(b"L");
+                h.update(&rel);
+                h.update(b"\0");
+                let target = std::fs::read_link(e.path())?;
+                h.update(target.as_os_str().as_encoded_bytes());
+                h.update(b"\0");
+            } else if ft.is_dir() {
+                h.update(b"D");
+                h.update(&rel);
+                h.update(b"\0");
+                let child_prefix = [rel.as_slice(), b"/"].concat();
+                walk(h, &e.path(), &child_prefix)?;
+            } else {
+                h.update(b"F");
+                h.update((md.mode() & 0o7777).to_le_bytes());
+                h.update(&rel);
+                h.update(b"\0");
+                h.update(md.len().to_le_bytes());
+                let mut f = std::fs::File::open(e.path())?;
+                std::io::copy(&mut f, &mut HashWriter(h))?;
+            }
+        }
+        Ok(())
+    }
+    let mut h = Sha256::new();
+    walk(&mut h, dir, b"")?;
+    Ok(hex(h.finalize().into()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EvalCacheEntry {
+    drv: String,
+    packed: Vec<String>,
+}
+
+/// Eval output is determined by the attr, the locked inputs, the flake's
+/// own source tree, and the guest nix (store path + closure image).
+fn eval_cache_key(
+    attr: &str,
+    inputs: &[(String, Locked)],
+    flake_dir: &Path,
+    nix_root: &str,
+) -> anyhow::Result<String> {
+    let mut h = Sha256::new();
+    h.update(b"flaky-eval-v1\0");
+    h.update(attr.as_bytes());
+    h.update(b"\0");
+    for (name, locked) in inputs {
+        h.update(name.as_bytes());
+        h.update(b"\0");
+        h.update(locked.owner.as_bytes());
+        h.update(b"/");
+        h.update(locked.repo.as_bytes());
+        h.update(b"@");
+        h.update(locked.rev.as_bytes());
+        h.update(b"\0");
+        h.update(locked.nar_hash.as_bytes());
+        h.update(b"\0");
+    }
+    h.update(hash_flake_dir(flake_dir)?.as_bytes());
+    h.update(b"\0");
+    h.update(nix_root.as_bytes());
+    h.update(b"\0");
+    h.update(hash_file(&Path::new(NIX_CLOSURE_DIR).join(NIX_CLOSURE_IMAGE))?.as_bytes());
+    Ok(hex(h.finalize().into()))
+}
+
+/// Rebuilds the orchestrator inputs from a cached eval: every closure
+/// source path lacking a per-path image must be covered by the stored
+/// flake-extras image, else the cache entry is unusable.
+fn extras_from_eval(
+    entry: &EvalCacheEntry,
+    cache_dir: &Path,
+) -> anyhow::Result<Option<BTreeMap<String, PathBuf>>> {
+    let drvs = nix_drv::parse(&entry.drv)?;
+    let root = nix_drv::find_root(&drvs).context("no unique root derivation in cached eval")?;
+    let closure = nix_drv::closure(&drvs, &root);
+    let produced: std::collections::BTreeSet<&String> = closure
+        .drvs
+        .iter()
+        .flat_map(|d| drvs[d].outputs.values().map(|o| &o.path))
+        .collect();
+    let mut missing = Vec::new();
+    for p in &closure.store_paths {
+        if produced.contains(p) || image_path_for(cache_dir, p).exists() {
+            continue;
+        }
+        if !entry.packed.contains(p) {
+            return Ok(None);
+        }
+        missing.push(p.clone());
+    }
+    let mut extra_images = BTreeMap::new();
+    if !missing.is_empty() {
+        let dest = cache_dir
+            .join("erofs")
+            .join(format!("flake-extras-{}.erofs", apis::store_hash(&root)));
+        if !dest.exists() {
+            return Ok(None);
+        }
+        for p in missing {
+            extra_images.insert(p, dest.clone());
+        }
+    }
+    Ok(Some(extra_images))
+}
+
 pub async fn run(
     flake_ref: FlakeRef,
     cache_url: String,
@@ -201,10 +345,62 @@ pub async fn run(
     let lock: Lock = serde_json::from_str(&lock_text).context("parsing flake.lock")?;
     let inputs = lock_inputs(&lock)?;
 
-    for d in ["erofs", "tmp"] {
+    for d in ["erofs", "tmp", "eval"] {
         std::fs::create_dir_all(cache_dir.join(d))?;
     }
 
+    let nix_root = std::fs::read_to_string(Path::new(NIX_CLOSURE_DIR).join("root"))?
+        .trim()
+        .to_string();
+    let key = eval_cache_key(&flake_ref.attr, &inputs, &dir, &nix_root)?;
+    let cache_file = cache_dir.join("eval").join(format!("{key}.json"));
+
+    let cached = std::fs::read_to_string(&cache_file)
+        .ok()
+        .and_then(|t| serde_json::from_str::<EvalCacheEntry>(&t).ok())
+        .and_then(|entry| {
+            extras_from_eval(&entry, &cache_dir)
+                .ok()
+                .flatten()
+                .map(|extras| (entry.drv.clone(), extras))
+        });
+
+    let (drv_json, extra_images) = match cached {
+        Some((text, extras)) => {
+            println!("flake: eval cache hit");
+            let _ = std::fs::write(cache_dir.join("last-eval.json"), &text);
+            (text, extras)
+        }
+        None => {
+            eval_in_vm(
+                flake_ref,
+                dir,
+                inputs,
+                nix_root,
+                cache_dir.clone(),
+                cache_file,
+            )
+            .await?
+        }
+    };
+
+    crate::orchestrator::run(BuildOpts {
+        drv_json,
+        cache_url,
+        cache_dir: cache_dir.clone(),
+        extra_images,
+    })
+    .await
+}
+
+async fn eval_in_vm(
+    flake_ref: FlakeRef,
+    dir: PathBuf,
+    inputs: Vec<(String, Locked)>,
+    nix_root: String,
+    cache_dir: PathBuf,
+    cache_file: PathBuf,
+) -> anyhow::Result<(String, BTreeMap<String, PathBuf>)> {
     let mut images = vec![ImageFile {
         name: NIX_CLOSURE_IMAGE.to_string(),
         path: PathBuf::from(NIX_CLOSURE_DIR).join(NIX_CLOSURE_IMAGE),
@@ -232,9 +428,6 @@ pub async fn run(
         });
     }
 
-    let nix_root = std::fs::read_to_string(Path::new(NIX_CLOSURE_DIR).join("root"))?
-        .trim()
-        .to_string();
     let scratch = cache_dir.join("tmp").join("flake-extras.img");
     prep_scratch(&scratch, EXTRAS_DEVICE_SIZE)?;
 
@@ -316,19 +509,19 @@ pub async fn run(
                     extra_images.insert(p.clone(), dest.clone());
                 }
             }
-            Ok((text, extra_images))
+            Ok((text, extra_images, missing))
         })
         .await;
     vm.reap(std::time::Duration::from_secs(120)).await;
-    let (drv_json, extra_images) = outcome?;
+    let (drv_json, extra_images, missing) = outcome?;
 
-    crate::orchestrator::run(BuildOpts {
-        drv_json,
-        cache_url,
-        cache_dir: cache_dir.clone(),
-        extra_images,
-    })
-    .await
+    let entry = EvalCacheEntry {
+        drv: drv_json.clone(),
+        packed: missing,
+    };
+    std::fs::write(&cache_file, serde_json::to_string(&entry)?)?;
+
+    Ok((drv_json, extra_images))
 }
 
 #[cfg(test)]
