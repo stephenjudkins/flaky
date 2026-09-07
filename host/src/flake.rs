@@ -312,6 +312,8 @@ fn hash_flake_dir(dir: &Path) -> anyhow::Result<String> {
 struct EvalCacheEntry {
     drv: String,
     packed: Vec<String>,
+    #[serde(default)]
+    extras_image: Option<String>,
 }
 
 /// Eval output is determined by the attr, the locked inputs, the flake's
@@ -330,9 +332,9 @@ fn eval_cache_key(
         h.update(name.as_bytes());
         h.update(b"\0");
         h.update(locked.owner.as_bytes());
-        h.update(b"/");
+        h.update("/");
         h.update(locked.repo.as_bytes());
-        h.update(b"@");
+        h.update("@");
         h.update(locked.rev.as_bytes());
         h.update(b"\0");
         h.update(locked.nar_hash.as_bytes());
@@ -348,7 +350,7 @@ fn eval_cache_key(
 
 /// Rebuilds the orchestrator inputs from a cached eval: every closure
 /// source path lacking a per-path image must be covered by the stored
-/// flake-extras image, else the cache entry is unusable.
+/// extras image, else the cache entry is unusable.
 fn extras_from_eval(
     entry: &EvalCacheEntry,
     cache_dir: &Path,
@@ -373,9 +375,11 @@ fn extras_from_eval(
     }
     let mut extra_images = BTreeMap::new();
     if !missing.is_empty() {
-        let dest = cache_dir
-            .join("erofs")
-            .join(format!("flake-extras-{}.erofs", apis::store_hash(&root)));
+        let name = match &entry.extras_image {
+            Some(name) => name.clone(),
+            None => format!("flake-extras-{}.erofs", apis::store_hash(&root)),
+        };
+        let dest = cache_dir.join("erofs").join(&name);
         if !dest.exists() {
             return Ok(None);
         }
@@ -395,6 +399,35 @@ pub async fn run(
         .dir
         .canonicalize()
         .with_context(|| format!("resolving flake dir {}", flake_ref.dir.display()))?;
+    let evaluated = eval(&dir, std::slice::from_ref(&flake_ref.attr), &cache_dir).await?;
+    let drv_json = evaluated
+        .drv_jsons
+        .into_values()
+        .next()
+        .context("eval returned no derivation")?;
+    crate::orchestrator::run(BuildOpts {
+        drv_json,
+        cache_url,
+        cache_dir,
+        extra_images: evaluated.extra_images,
+    })
+    .await
+}
+
+pub(crate) struct Evaluated {
+    pub(crate) drv_jsons: BTreeMap<String, String>,
+    pub(crate) extra_images: BTreeMap<String, PathBuf>,
+}
+
+/// Evaluates `dir#attr` for each attr, using the eval cache where valid.
+/// Uncached attrs are evaluated by nix inside one guest VM; source paths
+/// nix creates during eval across all attrs are packed into one shared
+/// extras image.
+pub(crate) async fn eval(
+    dir: &Path,
+    attrs: &[String],
+    cache_dir: &Path,
+) -> anyhow::Result<Evaluated> {
     let lock_text = std::fs::read_to_string(dir.join("flake.lock"))
         .context("reading flake.lock (is this a flake?)")?;
     let lock: Lock = serde_json::from_str(&lock_text).context("parsing flake.lock")?;
@@ -407,63 +440,79 @@ pub async fn run(
     let nix_root = std::fs::read_to_string(Path::new(NIX_CLOSURE_DIR).join("root"))?
         .trim()
         .to_string();
-    let key = eval_cache_key(&flake_ref.attr, &inputs, &dir, &nix_root)?;
-    let cache_file = cache_dir.join("eval").join(format!("{key}.json"));
 
-    let cached = std::fs::read_to_string(&cache_file)
-        .ok()
-        .and_then(|t| serde_json::from_str::<EvalCacheEntry>(&t).ok())
-        .and_then(|entry| {
-            extras_from_eval(&entry, &cache_dir)
-                .ok()
-                .flatten()
-                .map(|extras| (entry.drv.clone(), extras))
-        });
-
-    let (drv_json, extra_images) = match cached {
-        Some((text, extras)) => {
-            println!("flake: eval cache hit");
-            let _ = std::fs::write(cache_dir.join("last-eval.json"), &text);
-            (text, extras)
+    let mut drv_jsons = BTreeMap::new();
+    let mut extra_images = BTreeMap::new();
+    let mut uncached = Vec::new();
+    for attr in attrs {
+        let key = eval_cache_key(attr, &inputs, dir, &nix_root)?;
+        let cache_file = cache_dir.join("eval").join(format!("{key}.json"));
+        let cached = std::fs::read_to_string(&cache_file)
+            .ok()
+            .and_then(|t| serde_json::from_str::<EvalCacheEntry>(&t).ok())
+            .and_then(|entry| {
+                extras_from_eval(&entry, cache_dir)
+                    .ok()
+                    .flatten()
+                    .map(|extras| (entry.drv.clone(), extras))
+            });
+        match cached {
+            Some((text, extras)) => {
+                println!("flake: eval cache hit ({attr})");
+                let _ = std::fs::write(cache_dir.join("last-eval.json"), &text);
+                drv_jsons.insert(attr.clone(), text);
+                extra_images.extend(extras);
+            }
+            None => uncached.push(attr.clone()),
         }
-        None => {
-            eval_in_vm(
-                flake_ref,
-                dir,
-                inputs,
-                nix_root,
-                cache_dir.clone(),
-                cache_file,
-            )
-            .await?
-        }
-    };
+    }
 
-    crate::orchestrator::run(BuildOpts {
-        drv_json,
-        cache_url,
-        cache_dir: cache_dir.clone(),
+    if !uncached.is_empty() {
+        let (texts, extras) = eval_in_vm(dir, &inputs, &uncached, &nix_root, cache_dir).await?;
+        drv_jsons.extend(texts);
+        extra_images.extend(extras);
+    }
+
+    Ok(Evaluated {
+        drv_jsons,
         extra_images,
     })
-    .await
+}
+
+/// Closure source paths of a fresh eval that neither build outputs nor
+/// cached per-path images cover: these must come from the extras image.
+fn missing_paths(drv_json: &str, cache_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let drvs = nix_drv::parse(drv_json).context("parsing derivation show output")?;
+    let root = nix_drv::find_root(&drvs)
+        .ok_or_else(|| anyhow!("no unique root derivation in eval output"))?;
+    let closure = nix_drv::closure(&drvs, &root);
+    let produced: std::collections::BTreeSet<&String> = closure
+        .drvs
+        .iter()
+        .flat_map(|d| drvs[d].outputs.values().map(|o| &o.path))
+        .collect();
+    Ok(closure
+        .store_paths
+        .into_iter()
+        .filter(|p| !produced.contains(p) && !image_path_for(cache_dir, p).exists())
+        .collect())
 }
 
 async fn eval_in_vm(
-    flake_ref: FlakeRef,
-    dir: PathBuf,
-    inputs: Vec<(String, Locked)>,
-    nix_root: String,
-    cache_dir: PathBuf,
-    cache_file: PathBuf,
-) -> anyhow::Result<(String, BTreeMap<String, PathBuf>)> {
+    dir: &Path,
+    inputs: &[(String, Locked)],
+    attrs: &[String],
+    nix_root: &str,
+    cache_dir: &Path,
+) -> anyhow::Result<(BTreeMap<String, String>, BTreeMap<String, PathBuf>)> {
     let mut images = vec![ImageFile {
         name: NIX_CLOSURE_IMAGE.to_string(),
         path: PathBuf::from(NIX_CLOSURE_DIR).join(NIX_CLOSURE_IMAGE),
     }];
     let mut specs = Vec::new();
-    for (name, locked) in &inputs {
+    for (name, locked) in inputs {
         let store_path = nix_drv::source_store_path(&locked.nar_hash);
-        let dest = image_path_for(&cache_dir, &store_path);
+        let dest = image_path_for(cache_dir, &store_path);
         if dest.exists() {
             eprintln!("flake: input {name} already cached");
         } else {
@@ -495,59 +544,52 @@ async fn eval_in_vm(
             readonly: false,
         }],
     );
-    spec.src_dir = Some(dir);
+    spec.src_dir = Some(dir.to_path_buf());
     let vm = Vm::boot(spec).context("booting eval vm")?;
 
-    let rpc_cache_dir = cache_dir.clone();
-    let eval_req = apis::FlakeEvalRequest {
-        nix_image: NIX_CLOSURE_IMAGE.to_string(),
-        nix_root,
-        attr: flake_ref.attr.clone(),
-        inputs: specs,
-    };
+    let reqs: Vec<apis::FlakeEvalRequest> = attrs
+        .iter()
+        .map(|attr| apis::FlakeEvalRequest {
+            nix_image: NIX_CLOSURE_IMAGE.to_string(),
+            nix_root: nix_root.to_string(),
+            attr: attr.clone(),
+            inputs: specs.clone(),
+        })
+        .collect();
 
+    let rpc_cache_dir = cache_dir.to_path_buf();
     let outcome = vm
         .guest_rpc(move |c| async move {
-            let text = c
-                .flake_eval(crate::rpc::rpc_context(), eval_req)
-                .await
-                .map_err(|e| anyhow::anyhow!("flake_eval rpc: {e}"))?
-                .map_err(anyhow::Error::msg)?;
-            let drvs = {
+            let mut per_attr = BTreeMap::new();
+            for req in reqs {
+                let attr = req.attr.clone();
+                let text = c
+                    .flake_eval(crate::rpc::rpc_context(), req)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("flake_eval rpc: {e}"))?
+                    .map_err(anyhow::Error::msg)?;
                 let _ = std::fs::write(rpc_cache_dir.join("last-eval.json"), &text);
-                nix_drv::parse(&text).context("parsing derivation show output")?
-            };
-            let root = nix_drv::find_root(&drvs)
-                .ok_or_else(|| anyhow!("no unique root derivation in eval output"))?;
-            let closure = nix_drv::closure(&drvs, &root);
-            let produced: std::collections::BTreeSet<&String> = closure
-                .drvs
-                .iter()
-                .flat_map(|d| drvs[d].outputs.values().map(|o| &o.path))
-                .collect();
-            let mut missing = Vec::new();
-            for p in &closure.store_paths {
-                if produced.contains(p) {
-                    continue;
-                }
-                if image_path_for(&rpc_cache_dir, p).exists() {
-                    continue;
-                }
-                missing.push(p.clone());
+                let missing = missing_paths(&text, &rpc_cache_dir)?;
+                per_attr.insert(attr, (text, missing));
             }
+            let union: std::collections::BTreeSet<String> = per_attr
+                .values()
+                .flat_map(|(_, m)| m.iter().cloned())
+                .collect();
             let mut extra_images = BTreeMap::new();
-            if missing.is_empty() {
+            let mut extras_name = None;
+            if union.is_empty() {
                 let _ = std::fs::remove_file(&scratch);
             } else {
                 println!(
                     "flake: packing {} eval-created source paths from guest",
-                    missing.len()
+                    union.len()
                 );
                 let size = c
                     .pack_store_paths(
                         crate::rpc::rpc_context(),
                         apis::PackPathsRequest {
-                            paths: missing.clone(),
+                            paths: union.iter().cloned().collect(),
                             device: "/dev/vda".to_string(),
                         },
                     )
@@ -556,27 +598,46 @@ async fn eval_in_vm(
                     .map_err(anyhow::Error::msg)?;
                 let f = std::fs::OpenOptions::new().write(true).open(&scratch)?;
                 f.set_len(size)?;
-                let dest = rpc_cache_dir
-                    .join("erofs")
-                    .join(format!("flake-extras-{}.erofs", apis::store_hash(&root)));
+                let mut h = Sha256::new();
+                for p in &union {
+                    h.update(p.as_bytes());
+                    h.update(b"\0");
+                }
+                let name = format!("flake-extras-{}.erofs", hex(h.finalize().into()));
+                let dest = rpc_cache_dir.join("erofs").join(&name);
                 std::fs::rename(&scratch, &dest)?;
-                for p in &missing {
+                for p in &union {
                     extra_images.insert(p.clone(), dest.clone());
                 }
+                extras_name = Some(name);
             }
-            Ok((text, extra_images, missing))
+            Ok((per_attr, extra_images, extras_name))
         })
         .await;
     vm.reap(std::time::Duration::from_secs(120)).await;
-    let (drv_json, extra_images, missing) = outcome?;
+    let (per_attr, extra_images, extras_name) = outcome?;
 
-    let entry = EvalCacheEntry {
-        drv: drv_json.clone(),
-        packed: missing,
-    };
-    std::fs::write(&cache_file, serde_json::to_string(&entry)?)?;
+    for (attr, (text, missing)) in &per_attr {
+        let key = eval_cache_key(attr, inputs, dir, nix_root)?;
+        let entry = EvalCacheEntry {
+            drv: text.clone(),
+            packed: missing.clone(),
+            extras_image: match &extras_name {
+                Some(name) if !missing.is_empty() => Some(name.clone()),
+                _ => None,
+            },
+        };
+        let cache_file = cache_dir.join("eval").join(format!("{key}.json"));
+        std::fs::write(&cache_file, serde_json::to_string(&entry)?)?;
+    }
 
-    Ok((drv_json, extra_images))
+    Ok((
+        per_attr
+            .into_iter()
+            .map(|(attr, (text, _))| (attr, text))
+            .collect(),
+        extra_images,
+    ))
 }
 
 #[cfg(test)]

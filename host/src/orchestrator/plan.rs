@@ -24,6 +24,7 @@ pub(super) async fn plan<'a>(
     closure: &'a Closure,
     root: &'a str,
     opts: &'a BuildOpts,
+    expand_roots: bool,
 ) -> anyhow::Result<Ctx<'a>> {
     let cache = NixCache::new(&opts.cache_url)
         .context("creating cache client")?
@@ -36,11 +37,13 @@ pub(super) async fn plan<'a>(
     // fast path: when every output of the root drv already has a local
     // image, the build goal is already realized — no lookups or VM builds
     // can be needed (delete an output image in .cache/erofs to force a
-    // rebuild).
-    if drvs[root]
-        .outputs
-        .values()
-        .all(|o| image_path(opts, &o.path).exists())
+    // rebuild). Closure goals always plan fully: the root's runtime
+    // references may still be missing images.
+    if !expand_roots
+        && drvs[root]
+            .outputs
+            .values()
+            .all(|o| image_path(opts, &o.path).exists())
     {
         let images = drvs[root]
             .outputs
@@ -98,19 +101,25 @@ pub(super) async fn plan<'a>(
         },
         images,
     };
-    resolve(&mut ctx, root).await?;
+    resolve(&mut ctx, root, expand_roots).await?;
     Ok(ctx)
 }
 
-async fn resolve(ctx: &mut Ctx<'_>, root: &str) -> anyhow::Result<()> {
+async fn resolve(ctx: &mut Ctx<'_>, root: &str, expand_roots: bool) -> anyhow::Result<()> {
     let mut to_build: BTreeSet<String> = BTreeSet::new();
-    // (store path, expand references?) — expansion only applies to inputs
-    // of builds; the root outputs are the goal itself, not build inputs
-    let mut frontier: VecDeque<(String, bool)> = ctx.drvs[root]
-        .outputs
-        .values()
-        .map(|o| (o.path.clone(), false))
-        .collect();
+    // (store path, expand references?) — expansion applies to inputs of
+    // builds and, for closure goals, to the root output itself; otherwise
+    // the root outputs are the goal, not build inputs
+    let mut frontier: VecDeque<(String, bool)> = match expand_roots {
+        true => super::primary_output(ctx.drvs, root)
+            .map(|p| VecDeque::from([(p, true)]))
+            .unwrap_or_default(),
+        false => ctx.drvs[root]
+            .outputs
+            .values()
+            .map(|o| (o.path.clone(), false))
+            .collect(),
+    };
     let mut done: BTreeSet<String> = BTreeSet::new();
 
     while let Some((p, expand)) = frontier.pop_front() {

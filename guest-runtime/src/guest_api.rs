@@ -72,4 +72,8 @@ impl GuestApi for GuestApiServer {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         "shutting down".to_string()
     }
+
+    async fn shell(self, _: context::Context, request: apis::ShellRequest) -> Result<i32, String> {
+        crate::runner::shell(request).await
+    }
 }

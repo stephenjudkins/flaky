@@ -10,6 +10,7 @@ mod image_fs;
 mod nar;
 mod orchestrator;
 mod rpc;
+mod shell;
 mod tarball;
 mod vm;
 mod vsock_device;
@@ -41,6 +42,14 @@ enum Cmd {
     },
     /// Run `nix --version` in the guest
     NixVersion,
+    /// Run an interactive shell in a microvm with nixpkgs packages
+    Shell {
+        installables: Vec<String>,
+        #[arg(long, default_value = "https://cache.nixos.org")]
+        cache: String,
+        #[arg(long, default_value = ".cache")]
+        cache_dir: PathBuf,
+    },
     /// Evaluate a nix expression in the guest
     NixEval {
         /// Expression text, e.g. '1 + 1'
@@ -93,6 +102,13 @@ async fn async_main(cmd: Cmd) -> Result<()> {
                 .map(|out_path| println!("built: {out_path}"))
         }
         Cmd::NixVersion => nix_version().await,
+        Cmd::Shell {
+            installables,
+            cache,
+            cache_dir,
+        } => shell::run(installables, cache, cache_dir)
+            .await
+            .map(|()| println!("shell: exited")),
         Cmd::NixEval { expr, file } => {
             let expr = match (expr, file) {
                 (Some(e), None) => e,

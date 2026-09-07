@@ -81,17 +81,24 @@ pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
         req.attr,
         req.inputs.len()
     );
-    setup_nix(&req.nix_image).map_err(|e| format!("setup: {e}"))?;
-    fs::create_dir_all("/nix/var/nix").map_err(|e| format!("setup: {e}"))?;
-    fs::create_dir_all("/tmp").map_err(|e| format!("setup: {e}"))?;
+    // repeated calls (one per attr) reuse the setup and mounts: the source
+    // trees must stay at non-store paths, else nix tries to make the
+    // read-only binds writable while copying them onto themselves
+    if !Path::new("/nix/var/nix").exists() {
+        setup_nix(&req.nix_image).map_err(|e| format!("setup: {e}"))?;
+        fs::create_dir_all("/nix/var/nix").map_err(|e| format!("setup: {e}"))?;
+        fs::create_dir_all("/tmp").map_err(|e| format!("setup: {e}"))?;
+    }
 
     let mut overrides: Vec<(String, String)> = Vec::new();
     for inp in &req.inputs {
         let vol = apis::volume_id(&inp.store_path);
         let mnt = Path::new("/inputs").join(&vol);
-        fs::create_dir_all(&mnt).map_err(|e| format!("setup: {e}"))?;
-        mount_fs(&Path::new(IMAGE_DIR).join(&inp.image), &mnt, "erofs", true)
-            .map_err(|e| format!("setup: {e}"))?;
+        if !mnt.exists() {
+            fs::create_dir_all(&mnt).map_err(|e| format!("setup: {e}"))?;
+            mount_fs(&Path::new(IMAGE_DIR).join(&inp.image), &mnt, "erofs", true)
+                .map_err(|e| format!("setup: {e}"))?;
+        }
         overrides.push((
             inp.name.clone(),
             mnt.join(nix_drv::basename(&inp.store_path))
@@ -101,20 +108,22 @@ pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
     }
     println!("guest: mounted {} flake inputs", overrides.len());
 
-    fs::create_dir_all("/flake").map_err(|e| format!("setup: {e}"))?;
-    mount_err(
-        nix::mount::mount(
-            Some("flaky-src"),
-            "/flake",
-            Some("virtiofs"),
-            nix::mount::MsFlags::MS_RDONLY
-                | nix::mount::MsFlags::MS_NODEV
-                | nix::mount::MsFlags::MS_NOSUID,
-            None::<&str>,
-        ),
-        "mount virtiofs flaky-src on /flake",
-    )
-    .map_err(|e| format!("setup: {e}"))?;
+    if !Path::new("/flake/flake.nix").exists() {
+        fs::create_dir_all("/flake").map_err(|e| format!("setup: {e}"))?;
+        mount_err(
+            nix::mount::mount(
+                Some("flaky-src"),
+                "/flake",
+                Some("virtiofs"),
+                nix::mount::MsFlags::MS_RDONLY
+                    | nix::mount::MsFlags::MS_NODEV
+                    | nix::mount::MsFlags::MS_NOSUID,
+                None::<&str>,
+            ),
+            "mount virtiofs flaky-src on /flake",
+        )
+        .map_err(|e| format!("setup: {e}"))?;
+    }
 
     let mut args: Vec<String> = vec![
         "--offline".into(),
@@ -130,4 +139,54 @@ pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
     args.push(format!("/flake#{}", req.attr));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_nix(&req.nix_root, &arg_refs).await
+}
+
+pub async fn shell(req: apis::ShellRequest) -> Result<i32, String> {
+    let setup = || -> std::io::Result<()> {
+        mount_base()?;
+        fs::create_dir_all("/nix/store")?;
+        fs::set_permissions("/nix/store", fs::Permissions::from_mode(0o755))?;
+        fs::create_dir_all("/inputs")?;
+        fs::create_dir_all("/root")?;
+        fs::create_dir_all("/tmp")?;
+        mount_image_files()?;
+        for inp in &req.inputs {
+            let image = Path::new(IMAGE_DIR).join(apis::image_name(&inp.store_path));
+            let mnt = Path::new("/inputs").join(&inp.volume_id);
+            fs::create_dir_all(&mnt)?;
+            mount_fs(&image, &mnt, "erofs", true)?;
+            bind_from_image(&mnt, &inp.store_path)?;
+        }
+        Ok(())
+    };
+    setup().map_err(|e| format!("setup: {e}"))?;
+
+    let mut cmd = tokio::process::Command::new(&req.shell);
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .env_clear()
+        .env("PATH", req.path.join(":"))
+        .env("HOME", "/root")
+        .env("TERM", &req.term)
+        .current_dir("/");
+    // the session loop keeps serving RPCs; the shell shares the console.
+    // New session + controlling tty so job control (Ctrl-C) works.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY, 0 as *mut libc::c_void) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = cmd
+        .status()
+        .await
+        .map_err(|e| format!("spawning shell: {e}"))?;
+    Ok(status.code().unwrap_or(1))
 }

@@ -9,6 +9,7 @@ pub trait GuestApi {
     async fn nix_eval(image: String, nix_root: String, expr: String) -> Result<String, String>;
     async fn flake_eval(request: FlakeEvalRequest) -> Result<String, String>;
     async fn pack_store_paths(request: PackPathsRequest) -> Result<u64, String>;
+    async fn shell(request: ShellRequest) -> Result<i32, String>;
     async fn shutdown() -> String;
 }
 
@@ -33,6 +34,18 @@ pub struct FlakeEvalRequest {
 pub struct PackPathsRequest {
     pub paths: Vec<String>,
     pub device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRequest {
+    /// Store paths to mount and bind into /nix/store (the reference
+    /// closures of everything the shell may run).
+    pub inputs: Vec<InputSpec>,
+    /// Absolute path of the shell binary to exec.
+    pub shell: String,
+    /// PATH entries, in order.
+    pub path: Vec<String>,
+    pub term: String,
 }
 
 /// How a store path is provided to the guest.

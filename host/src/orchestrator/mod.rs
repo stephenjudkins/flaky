@@ -84,26 +84,84 @@ fn producing_drv(closure: &Closure, drvs: &Derivations, path: &str) -> Option<St
         .cloned()
 }
 
+/// The output a build goal is after: `out` when present (nix's default
+/// output selection), else the first declared output.
+fn primary_output(drvs: &Derivations, root: &str) -> Option<String> {
+    drvs[root]
+        .outputs
+        .iter()
+        .find(|(name, _)| *name == "out")
+        .or_else(|| drvs[root].outputs.iter().next())
+        .map(|(_, o)| o.path.clone())
+}
+
+pub struct Realized {
+    pub out_path: String,
+    /// The runtime reference closure of `out_path` (roots included). Only
+    /// computed by `realize_closure`; every path in it has an image.
+    pub paths: BTreeSet<String>,
+}
+
+/// Realizes the root drv's default output and returns its store path.
 pub async fn run(opts: BuildOpts) -> anyhow::Result<String> {
+    Ok(realize(opts, false).await?.out_path)
+}
+
+/// Like `run`, but also materializes and returns the runtime reference
+/// closure of the default output — what a consumer needs to *run* the
+/// output, as opposed to building it.
+pub async fn realize_closure(opts: BuildOpts) -> anyhow::Result<Realized> {
+    realize(opts, true).await
+}
+
+async fn realize(opts: BuildOpts, expand_roots: bool) -> anyhow::Result<Realized> {
     let drvs = nix_drv::parse(&opts.drv_json).context("parsing derivation json")?;
     let root = nix_drv::find_root(&drvs).ok_or_else(|| anyhow!("no unique root derivation"))?;
     let closure = nix_drv::closure(&drvs, &root);
-    let root_out: Option<String> = drvs[&root].outputs.values().next().map(|o| o.path.clone());
+    let root_out = primary_output(&drvs, &root);
     println!(
         "build: root {root}, closure: {} drvs / {} store paths",
         closure.drvs.len(),
         closure.store_paths.len()
     );
 
-    let mut ctx = plan::plan(&drvs, &closure, &root, &opts).await?;
+    let mut ctx = plan::plan(&drvs, &closure, &root, &opts, expand_roots).await?;
     fetch::fetch_images(&mut ctx).await?;
     for drv_path in ctx.plan.to_build.clone() {
         exec::build_one(&mut ctx, &drv_path).await?;
     }
-    root_out.ok_or_else(|| anyhow!("root derivation has no outputs"))
+    let out_path = root_out.ok_or_else(|| anyhow!("root derivation has no outputs"))?;
+    let paths = if expand_roots {
+        ctx.output_closure(&out_path)?
+    } else {
+        BTreeSet::new()
+    };
+    Ok(Realized { out_path, paths })
 }
 
 impl<'a> Ctx<'a> {
+    /// The transitive reference closure of an already-realized path.
+    /// Every path in the set is guaranteed to have an image (fetched,
+    /// built, or preloaded during planning).
+    fn output_closure(&self, out_path: &str) -> anyhow::Result<BTreeSet<String>> {
+        let mut seen: BTreeSet<String> = BTreeSet::from([out_path.to_string()]);
+        let mut queue: VecDeque<String> = VecDeque::from([out_path.to_string()]);
+        while let Some(p) = queue.pop_front() {
+            for r in self.refs_of(&p) {
+                if seen.insert(r.clone()) {
+                    queue.push_back(r);
+                }
+            }
+        }
+        for p in &seen {
+            anyhow::ensure!(
+                self.images.contains_key(p),
+                "no image for {p} in the reference closure of {out_path}"
+            );
+        }
+        Ok(seen)
+    }
+
     /// The direct input paths of a drv: declared sources, the requested
     /// outputs of its input drvs, and anything named in builder/args/env
     /// (e.g. the `builder` path, which Nix does not require to be declared).
