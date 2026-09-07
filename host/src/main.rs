@@ -10,6 +10,7 @@ mod image_fs;
 mod nar;
 mod orchestrator;
 mod rpc;
+mod tarball;
 mod vm;
 mod vsock_device;
 mod vsock_pipe;

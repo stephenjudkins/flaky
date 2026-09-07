@@ -61,8 +61,8 @@ async fn backpressure_test() {
         ErrorKind::WouldBlock
     );
     let mut buf = [0u8; 2];
-    host.read(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"ab");
+    let n = host.read(&mut buf).await.unwrap();
+    assert_eq!((n, &buf[..n]), (2usize, &b"ab"[..]));
     assert!(wakes.load(Ordering::SeqCst) > 0);
     assert_eq!(dev.try_write(b"ef").unwrap(), 2);
 }

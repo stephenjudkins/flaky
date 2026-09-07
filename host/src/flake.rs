@@ -125,7 +125,9 @@ async fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// Fetches the github tarball, verifies its NAR hash against the lock, and
-/// packs it as a hash-addressed erofs image.
+/// packs it as a hash-addressed erofs image. Streams the tarball directly
+/// into the image; falls back to unpacking to disk when the tarball has an
+/// unexpected shape.
 async fn fetch_input_image(
     locked: &Locked,
     store_path: &str,
@@ -138,25 +140,24 @@ async fn fetch_input_image(
     );
     eprintln!("flake: fetching {url}");
     std::fs::create_dir_all(tmp_dir)?;
-    let tgz = tmp_dir.join("input.tar.gz");
-    download(&url, &tgz).await?;
-
-    let unpack = tmp_dir.join("unpacked");
-    std::fs::create_dir_all(&unpack)?;
-    let gz = flate2::read::GzDecoder::new(std::fs::File::open(&tgz)?);
-    let mut archive = tar::Archive::new(gz);
-    archive.unpack(&unpack)?;
-    let tree = unpack.join(format!("{}-{}", locked.repo, locked.rev));
-    anyhow::ensure!(tree.is_dir(), "tarball has unexpected layout");
-
     let base = nix_drv::basename(store_path);
     let volume = apis::volume_id(store_path);
     let tmp_img = tmp_dir.join("image.erofs");
-    let file = tokio::fs::File::create(&tmp_img).await?;
-    let mut writer = nar_to_erofs::image_writer(file, &volume).await?;
-    let mut decoder = nar_to_erofs::NarDecoder::new(HashReader::new(DirNar::new(&tree)));
-    nar_to_erofs::write_nar(&mut decoder, &mut writer, Some(base)).await?;
-    let digest = decoder.into_inner().digest();
+    let top = format!("{}-{}", locked.repo, locked.rev);
+    let writer = match stream_fetch(&url, &top, &base, &volume, &tmp_img).await {
+        Ok(w) => w,
+        Err(reason) => {
+            eprintln!("flake: streaming fetch fell back to disk: {reason}");
+            fetch_via_disk(&url, &top, tmp_dir, &base, &volume, &tmp_img).await?
+        }
+    };
+    let (file, size) = nar_to_erofs::finish_image(writer).await?;
+    file.set_len(size).await?;
+    file.sync_all().await?;
+    drop(file);
+    let digest = crate::tarball::image_nar_digest(&tmp_img)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let expected = expected_nar_hash(&locked.nar_hash)?;
     anyhow::ensure!(
         digest == expected,
@@ -166,17 +167,63 @@ async fn fetch_input_image(
         locked.nar_hash,
         nix_drv::nix_base32_encode(&digest),
     );
-    let (file, size) = nar_to_erofs::finish_image(writer).await?;
-    file.set_len(size).await?;
-    file.sync_all().await?;
     std::fs::rename(&tmp_img, dest)?;
-    let _ = std::fs::remove_file(&tgz);
-    let _ = std::fs::remove_dir_all(&unpack);
     println!(
         "flake: fetched {}/{} (image {} bytes)",
         locked.owner, locked.repo, size
     );
     Ok(())
+}
+
+async fn stream_fetch(
+    url: &str,
+    top: &str,
+    base: &str,
+    volume: &str,
+    tmp_img: &Path,
+) -> Result<crate::tarball::ImageWriter, String> {
+    use futures::TryStreamExt as _;
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("download: {e}"))?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| format!("download: {e}"))?;
+    let stream = resp
+        .bytes_stream()
+        .map_err(|e| std::io::Error::other(format!("download: {e}")));
+    let tar = async_compression::tokio::bufread::GzipDecoder::new(tokio::io::BufReader::new(
+        tokio_util::io::StreamReader::new(stream),
+    ));
+    crate::tarball::tar_to_image(tar, top, base, volume, tmp_img).await
+}
+
+async fn fetch_via_disk(
+    url: &str,
+    top: &str,
+    tmp_dir: &Path,
+    base: &str,
+    volume: &str,
+    tmp_img: &Path,
+) -> anyhow::Result<crate::tarball::ImageWriter> {
+    let tgz = tmp_dir.join("input.tar.gz");
+    download(url, &tgz).await?;
+
+    let unpack = tmp_dir.join("unpacked");
+    std::fs::create_dir_all(&unpack)?;
+    let gz = flate2::read::GzDecoder::new(std::fs::File::open(&tgz)?);
+    let mut archive = tar::Archive::new(gz);
+    archive.unpack(&unpack)?;
+    let tree = unpack.join(top);
+    anyhow::ensure!(tree.is_dir(), "tarball has unexpected layout");
+
+    let file = tokio::fs::File::create(tmp_img).await?;
+    let mut writer = nar_to_erofs::image_writer(file, volume).await?;
+    let mut decoder = nar_to_erofs::NarDecoder::new(HashReader::new(DirNar::new(&tree)));
+    nar_to_erofs::write_nar(&mut decoder, &mut writer, Some(base)).await?;
+    let _ = std::fs::remove_file(&tgz);
+    let _ = std::fs::remove_dir_all(&unpack);
+    Ok(writer)
 }
 
 fn prep_scratch(path: &Path, size: u64) -> anyhow::Result<()> {
