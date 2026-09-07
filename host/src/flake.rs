@@ -139,40 +139,48 @@ async fn fetch_input_image(
         locked.owner, locked.repo, locked.rev
     );
     eprintln!("flake: fetching {url}");
-    std::fs::create_dir_all(tmp_dir)?;
     let base = nix_drv::basename(store_path);
     let volume = apis::volume_id(store_path);
-    let tmp_img = tmp_dir.join("image.erofs");
+    let mut tmp_img = dest.as_os_str().to_owned();
+    tmp_img.push(".download");
+    let tmp_img = PathBuf::from(tmp_img);
     let top = format!("{}-{}", locked.repo, locked.rev);
-    let writer = match stream_fetch(&url, &top, &base, &volume, &tmp_img).await {
-        Ok(w) => w,
-        Err(reason) => {
-            eprintln!("flake: streaming fetch fell back to disk: {reason}");
-            fetch_via_disk(&url, &top, tmp_dir, &base, &volume, &tmp_img).await?
-        }
-    };
-    let (file, size) = nar_to_erofs::finish_image(writer).await?;
-    file.set_len(size).await?;
-    file.sync_all().await?;
-    drop(file);
-    let digest = crate::tarball::image_nar_digest(&tmp_img)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    let expected = expected_nar_hash(&locked.nar_hash)?;
-    anyhow::ensure!(
-        digest == expected,
-        "narHash mismatch for input {}/{}: expected {}, got {}",
-        locked.owner,
-        locked.repo,
-        locked.nar_hash,
-        nix_drv::nix_base32_encode(&digest),
-    );
-    std::fs::rename(&tmp_img, dest)?;
-    println!(
-        "flake: fetched {}/{} (image {} bytes)",
-        locked.owner, locked.repo, size
-    );
-    Ok(())
+    let result = async {
+        let writer = match stream_fetch(&url, &top, base, &volume, &tmp_img).await {
+            Ok(w) => w,
+            Err(reason) => {
+                eprintln!("flake: streaming fetch fell back to disk: {reason}");
+                fetch_via_disk(&url, &top, tmp_dir, base, &volume, &tmp_img).await?
+            }
+        };
+        let (file, size) = nar_to_erofs::finish_image(writer).await?;
+        file.set_len(size).await?;
+        file.sync_all().await?;
+        drop(file);
+        let digest = crate::tarball::image_nar_digest(&tmp_img)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let expected = expected_nar_hash(&locked.nar_hash)?;
+        anyhow::ensure!(
+            digest == expected,
+            "narHash mismatch for input {}/{}: expected {}, got {}",
+            locked.owner,
+            locked.repo,
+            locked.nar_hash,
+            nix_drv::nix_base32_encode(&digest),
+        );
+        std::fs::rename(&tmp_img, dest)?;
+        println!(
+            "flake: fetched {}/{} (image {} bytes)",
+            locked.owner, locked.repo, size
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_img);
+    }
+    result
 }
 
 async fn stream_fetch(
