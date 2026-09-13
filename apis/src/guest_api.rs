@@ -26,7 +26,10 @@ pub struct FlakeInputSpec {
 pub struct FlakeEvalRequest {
     pub nix_image: String,
     pub nix_root: String,
-    pub attr: String,
+    /// Attrpaths to evaluate, e.g. legacyPackages.aarch64-linux.cowsay.
+    /// Evaluated by one guest-side nix invocation so the flake (nixpkgs)
+    /// loads once; the reply maps each attr to its root drv.
+    pub attrs: Vec<String>,
     pub inputs: Vec<FlakeInputSpec>,
 }
 

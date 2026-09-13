@@ -547,30 +547,71 @@ async fn eval_in_vm(
     spec.src_dir = Some(dir.to_path_buf());
     let vm = Vm::boot(spec).context("booting eval vm")?;
 
-    let reqs: Vec<apis::FlakeEvalRequest> = attrs
-        .iter()
-        .map(|attr| apis::FlakeEvalRequest {
-            nix_image: NIX_CLOSURE_IMAGE.to_string(),
-            nix_root: nix_root.to_string(),
-            attr: attr.clone(),
-            inputs: specs.clone(),
-        })
-        .collect();
+    let req = apis::FlakeEvalRequest {
+        nix_image: NIX_CLOSURE_IMAGE.to_string(),
+        nix_root: nix_root.to_string(),
+        attrs: attrs.to_vec(),
+        inputs: specs,
+    };
 
     let rpc_cache_dir = cache_dir.to_path_buf();
+    let rpc_attrs = attrs.to_vec();
     let outcome = vm
         .guest_rpc(move |c| async move {
+            let text = c
+                .flake_eval(crate::rpc::rpc_context(), req)
+                .await
+                .map_err(|e| anyhow::anyhow!("flake_eval rpc: {e}"))?
+                .map_err(anyhow::Error::msg)?;
+            let v: serde_json::Value =
+                serde_json::from_str(&text).context("parsing flake_eval response")?;
+            let roots = v["roots"].as_object().context("flake_eval roots")?;
+            let show = v
+                .get("show")
+                .cloned()
+                .context("flake_eval derivation output")?;
+            let _ = std::fs::write(
+                rpc_cache_dir.join("last-eval.json"),
+                serde_json::to_string_pretty(&show)?,
+            );
+            let show_text = serde_json::to_string(&show)?;
+            let drvs = nix_drv::parse(&show_text).context("parsing derivation show output")?;
+            // v4 show output nests the map under "derivations"
+            let inner = match show.get("derivations") {
+                Some(d) => d,
+                None => &show,
+            };
+            let inner = inner.as_object().context("derivation show output")?;
             let mut per_attr = BTreeMap::new();
-            for req in reqs {
-                let attr = req.attr.clone();
-                let text = c
-                    .flake_eval(crate::rpc::rpc_context(), req)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("flake_eval rpc: {e}"))?
-                    .map_err(anyhow::Error::msg)?;
-                let _ = std::fs::write(rpc_cache_dir.join("last-eval.json"), &text);
+            for attr in &rpc_attrs {
+                let root = match roots.get(attr).and_then(|r| r.as_str()) {
+                    Some(r) => r.to_string(),
+                    None => nix_drv::find_root(&drvs)
+                        .ok_or_else(|| anyhow!("no unique root derivation in eval output"))?,
+                };
+                let closure = nix_drv::closure(&drvs, &root);
+                let mut filtered = serde_json::Map::new();
+                for d in &closure.drvs {
+                    let entry = inner
+                        .get(d)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("eval output missing drv {d}"))?;
+                    filtered.insert(d.clone(), entry);
+                }
+                let text = match show.get("version") {
+                    Some(version) => {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("version".to_string(), version.clone());
+                        obj.insert(
+                            "derivations".to_string(),
+                            serde_json::Value::Object(filtered),
+                        );
+                        serde_json::Value::Object(obj).to_string()
+                    }
+                    None => serde_json::Value::Object(filtered).to_string(),
+                };
                 let missing = missing_paths(&text, &rpc_cache_dir)?;
-                per_attr.insert(attr, (text, missing));
+                per_attr.insert(attr.clone(), (text, missing));
             }
             let union: std::collections::BTreeSet<String> = per_attr
                 .values()

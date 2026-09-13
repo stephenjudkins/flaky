@@ -77,8 +77,8 @@ pub async fn nix_eval(image: String, nix_root: String, expr: String) -> Result<S
 
 pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
     println!(
-        "guest: flake_eval request (attr {}, {} inputs)",
-        req.attr,
+        "guest: flake_eval request ({} attrs, {} inputs)",
+        req.attrs.len(),
         req.inputs.len()
     );
     // repeated calls (one per attr) reuse the setup and mounts: the source
@@ -125,20 +125,86 @@ pub async fn flake_eval(req: apis::FlakeEvalRequest) -> Result<String, String> {
         .map_err(|e| format!("setup: {e}"))?;
     }
 
+    // --override-input is a subcommand flag, not a global one: it must
+    // come after `eval`/`derivation show`, not before
+    let mut flags: Vec<String> = Vec::new();
+    for (name, path) in &overrides {
+        flags.push("--override-input".into());
+        flags.push(name.clone());
+        flags.push(path.clone());
+    }
+
+    // derivation show output is keyed by drv path, not attr: map each attr
+    // to its root drv with one cheap eval per parent attrpath group, so
+    // attrs sharing a parent force their drvPaths in a single nix process
+    let mut roots = serde_json::Map::new();
+    if req.attrs.len() > 1 {
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut singles = Vec::new();
+        for attr in &req.attrs {
+            match attr.rsplit_once('.') {
+                Some((parent, child)) => groups
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(child.to_string()),
+                None => singles.push(attr.clone()),
+            }
+        }
+        for (parent, children) in &groups {
+            let names = children
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let apply = format!(
+                "o: builtins.mapAttrs (n: p: p.drvPath) (builtins.intersectAttrs (builtins.listToAttrs (builtins.map (n: {{ name = n; value = null; }}) [ {names} ])) o)",
+            );
+            let mut args: Vec<String> = vec!["--offline".into(), "eval".into(), "--json".into()];
+            args.extend(flags.iter().cloned());
+            args.push(format!("/flake#{parent}"));
+            args.push("--apply".into());
+            args.push(apply);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = run_nix(&req.nix_root, &refs).await?;
+            let map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&out).map_err(|e| format!("parsing eval map: {e}"))?;
+            for child in children {
+                let drv = map
+                    .get(child)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("attr {child} missing under {parent}"))?
+                    .to_string();
+                roots.insert(format!("{parent}.{child}"), serde_json::Value::String(drv));
+            }
+        }
+        for attr in singles {
+            let mut args: Vec<String> = vec!["--offline".into(), "eval".into(), "--json".into()];
+            args.extend(flags.iter().cloned());
+            args.push(format!("/flake#{attr}.drvPath"));
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = run_nix(&req.nix_root, &refs).await?;
+            let drv: String =
+                serde_json::from_str(&out).map_err(|e| format!("parsing drvPath: {e}"))?;
+            roots.insert(attr, serde_json::Value::String(drv));
+        }
+    }
+
+    // one derivation show for every attr: the flake loads once for all
     let mut args: Vec<String> = vec![
         "--offline".into(),
         "derivation".into(),
         "show".into(),
         "-r".into(),
     ];
-    for (name, path) in &overrides {
-        args.push("--override-input".into());
-        args.push(name.clone());
-        args.push(path.clone());
+    args.extend(flags);
+    for attr in &req.attrs {
+        args.push(format!("/flake#{attr}"));
     }
-    args.push(format!("/flake#{}", req.attr));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_nix(&req.nix_root, &arg_refs).await
+    let show = run_nix(&req.nix_root, &arg_refs).await?;
+    let show: serde_json::Value =
+        serde_json::from_str(&show).map_err(|e| format!("parsing derivation show: {e}"))?;
+    Ok(serde_json::json!({ "roots": roots, "show": show }).to_string())
 }
 
 pub async fn shell(req: apis::ShellRequest) -> Result<i32, String> {
