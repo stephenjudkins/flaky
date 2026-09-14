@@ -1,8 +1,12 @@
-//! Host-side build orchestration: figure out which missing store paths
-//! can be fetched from a binary cache and which derivations must be built
-//! in microVMs. Narinfo lookups are lazy: a path is only looked up at the
-//! moment we must materialize it and its EROFS image is absent, so a warm
-//! cache does zero network requests.
+//! Host-side build orchestration.
+//!
+//! Work is expressed as [`crate::task::Task`] values: fetching
+//! substitutions, verifying NAR hashes, evaluating nix expressions, and
+//! building derivations. The [`Orchestrator`] schedules tasks and mediates
+//! access to the outside world (nix cache, microVMs); it knows nothing
+//! about what the tasks do. Narinfo lookups are lazy: a path is only
+//! looked up at the moment we must materialize it and its EROFS image is
+//! absent, so a warm cache does zero network requests.
 //!
 //! Every store path gets its own EROFS image in `.cache/erofs/<hash>.erofs`
 //! (volume name = first 16 chars of the hash). Build inputs are exposed as
@@ -17,16 +21,19 @@
 //! 531-path drv closure (the rest are bootstrap *build* inputs, already
 //! compiled into the binaries we fetch).
 
-mod exec;
-mod fetch;
 mod plan;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use nix_cache::{CachedNar, NixCache};
 use nix_drv::{Closure, Derivations};
+use tokio::sync::Semaphore;
+
+use crate::task::{Context, TaskFuture};
+use crate::tasks::{BuildDrv, FetchNar, Fetchurl};
 
 const MAX_CONCURRENT_FETCHES: usize = 8;
 
@@ -41,33 +48,65 @@ pub struct BuildOpts {
     pub extra_images: BTreeMap<String, PathBuf>,
 }
 
-struct Plan {
+/// Shared orchestrator state handed to tasks through
+/// [`crate::task::Context`].
+pub(crate) struct Inner {
+    pub(crate) cache_dir: PathBuf,
+    pub(crate) nix_cache: NixCache,
+    /// Bounds concurrent network fetches (FetchNar, Fetchurl,
+    /// FetchInputImage).
+    pub(crate) fetch_sem: Arc<Semaphore>,
+}
+
+/// Schedules tasks and mediates access to the outside world. Dependency
+/// tracking (what is running, what depends on what) will live here later.
+pub struct Orchestrator {
+    inner: Arc<Inner>,
+}
+
+impl Orchestrator {
+    pub fn new(cache_url: &str, cache_dir: PathBuf) -> anyhow::Result<Self> {
+        let nix_cache = NixCache::new(cache_url)
+            .context("creating cache client")?
+            .with_disk_cache(cache_dir.join("narinfo"));
+        for d in ["erofs", "build", "tmp"] {
+            std::fs::create_dir_all(cache_dir.join(d))?;
+        }
+        Ok(Orchestrator {
+            inner: Arc::new(Inner {
+                cache_dir,
+                nix_cache,
+                fetch_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
+            }),
+        })
+    }
+
+    pub fn context(&self) -> Context {
+        Context::new(self.inner.clone())
+    }
+}
+
+pub(crate) struct Plan {
     /// Narinfo summaries (incl. references): preloaded from the local
     /// narinfo cache for image-present paths, plus everything fetched or
     /// looked up this run. Also drives `refs_of`.
-    hits: BTreeMap<String, CachedNar>,
+    pub(crate) hits: BTreeMap<String, CachedNar>,
     /// Missing paths available upstream: store path -> narinfo.
-    fetches: BTreeMap<String, CachedNar>,
+    pub(crate) fetches: BTreeMap<String, CachedNar>,
     /// Missing paths realized from builtin:fetchurl drvs: path -> drv.
-    fetchurl: BTreeMap<String, String>,
+    pub(crate) fetchurl: BTreeMap<String, String>,
     /// Drvs to build (dependencies first).
-    to_build: Vec<String>,
+    pub(crate) to_build: Vec<String>,
 }
 
-struct Ctx<'a> {
-    drvs: &'a Derivations,
-    closure: &'a Closure,
-    opts: &'a BuildOpts,
-    cache: NixCache,
-    plan: Plan,
+/// The decision state of a realization run: the closure graph, the plan
+/// decided for it, and the images known to exist.
+pub(crate) struct Workspace<'a> {
+    pub(crate) drvs: &'a Derivations,
+    pub(crate) closure: &'a Closure,
+    pub(crate) plan: Plan,
     /// store path -> erofs image (pre-existing, fetched, or built here).
-    images: BTreeMap<String, PathBuf>,
-}
-
-fn image_path(opts: &BuildOpts, store_path: &str) -> PathBuf {
-    opts.cache_dir
-        .join("erofs")
-        .join(format!("{}.erofs", apis::store_hash(store_path)))
+    pub(crate) images: BTreeMap<String, PathBuf>,
 }
 
 pub(crate) fn image_path_for(cache_dir: &std::path::Path, store_path: &str) -> PathBuf {
@@ -125,21 +164,78 @@ async fn realize(opts: BuildOpts, expand_roots: bool) -> anyhow::Result<Realized
         closure.store_paths.len()
     );
 
-    let mut ctx = plan::plan(&drvs, &closure, &root, &opts, expand_roots).await?;
-    fetch::fetch_images(&mut ctx).await?;
-    for drv_path in ctx.plan.to_build.clone() {
-        exec::build_one(&mut ctx, &drv_path).await?;
+    let orch = Orchestrator::new(&opts.cache_url, opts.cache_dir.clone())?;
+    let ctx = orch.context();
+
+    let mut ws = plan::plan(
+        &ctx,
+        &drvs,
+        &closure,
+        &root,
+        &opts.extra_images,
+        expand_roots,
+    )
+    .await?;
+
+    // fetch phase: substitutions and fetchurl realizations
+    let mut fetches: Vec<(String, TaskFuture<PathBuf>)> = Vec::new();
+    for (p, nar) in ws.plan.fetches.clone() {
+        fetches.push((p.clone(), ctx.spawn(FetchNar { store_path: p, nar })));
     }
+    for (p, drv_path) in ws.plan.fetchurl.clone() {
+        fetches.push((
+            p.clone(),
+            ctx.spawn(Fetchurl {
+                out_path: p,
+                drv: drvs[&drv_path].clone(),
+            }),
+        ));
+    }
+    if !fetches.is_empty() {
+        println!("build: fetching {} input images", fetches.len());
+    }
+    for (p, fut) in fetches {
+        let img = fut.await.with_context(|| format!("materializing {p}"))?;
+        ws.images.insert(p, img);
+    }
+
+    // build phase: dependencies first
+    for drv_path in ws.plan.to_build.clone() {
+        let inputs = ws
+            .input_set(&drv_path)?
+            .into_iter()
+            .map(|p| {
+                let img = ws
+                    .images
+                    .get(&p)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing image for input {p}"))?;
+                Ok((p, img))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let outputs = ctx
+            .spawn(BuildDrv {
+                drv_path: drv_path.clone(),
+                drv: drvs[&drv_path].clone(),
+                inputs,
+            })
+            .await
+            .with_context(|| format!("building {drv_path}"))?;
+        for (out, img) in outputs {
+            ws.images.insert(out, img);
+        }
+    }
+
     let out_path = root_out.ok_or_else(|| anyhow!("root derivation has no outputs"))?;
     let paths = if expand_roots {
-        ctx.output_closure(&out_path)?
+        ws.output_closure(&out_path)?
     } else {
         BTreeSet::new()
     };
     Ok(Realized { out_path, paths })
 }
 
-impl<'a> Ctx<'a> {
+impl Workspace<'_> {
     /// The transitive reference closure of an already-realized path.
     /// Every path in the set is guaranteed to have an image (fetched,
     /// built, or preloaded during planning).

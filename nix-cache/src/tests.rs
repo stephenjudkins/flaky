@@ -42,6 +42,28 @@ async fn disk_cache_serves_hits_without_network() {
 }
 
 #[test]
+fn parses_nix_base32_nar_hash() {
+    // real cache.nixos.org narinfo format
+    let text = "StorePath: /nix/store/846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3
+URL: nar/1akpk014pgd44rxrdcrp92jhd1li209xp1i4nhxvsfndm1d0hnz1.nar.zst
+Compression: zstd
+FileHash: sha256:0hhp7f3y1g8jfmqp3v30wrqryq3rsc5kzjjzljc81gxxflmqm4fg
+FileSize: 77097
+NarHash: sha256:1akpk014pgd44rxrdcrp92jhd1li209xp1i4nhxvsfndm1d0hnz1
+NarSize: 294440
+References: 846h582z2d4mifn4km7axlqllcyn6zdg-hello-2.12.3
+Deriver: lzg8d4i5vkiqi0f087klds3819125bd3-hello-2.12.3.drv
+System: aarch64-linux
+Sig: cache.nixos.org-1:fake
+";
+    let nar = parse_narinfo(text).unwrap();
+    assert_eq!(
+        nix_drv::nix_base32_encode(&nar.nar_hash),
+        "1akpk014pgd44rxrdcrp92jhd1li209xp1i4nhxvsfndm1d0hnz1"
+    );
+}
+
+#[test]
 fn legacy_miss_markers_are_removed() {
     let (cache, _dir) = disk_cache();
     let hash = StorePathHash::new("846h582z2d4mifn4km7axlqllcyn6zdg").unwrap();

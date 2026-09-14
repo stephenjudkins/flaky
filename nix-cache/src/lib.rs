@@ -94,9 +94,32 @@ pub struct CachedNar {
     pub compression: Compression,
     /// Size of the decompressed NAR in bytes.
     pub nar_size: u64,
+    /// sha256 of the decompressed NAR, for verifying fetched images.
+    pub nar_hash: [u8; 32],
     /// Store path names (hash-name, no /nix/store/ prefix) this path
     /// references, from the narinfo `References:` line.
     pub references: Vec<String>,
+}
+
+/// Parses a narinfo hash field: `sha256:<nix base32>` (as written by nix)
+/// or `sha256-<base64>` (SRI).
+fn parse_sha256(s: &str) -> Result<[u8; 32]> {
+    let body = s
+        .strip_prefix("sha256:")
+        .or_else(|| s.strip_prefix("sha256-"))
+        .ok_or_else(|| Error::Narinfo(format!("unsupported hash {s:?}")))?;
+    let bytes = if body.len() == 52 {
+        nix_drv::nix_base32_decode(body)
+            .ok_or_else(|| Error::Narinfo(format!("bad nix base32 hash {s:?}")))?
+    } else {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .map_err(|_| Error::Narinfo(format!("bad base64 hash {s:?}")))?
+    };
+    bytes
+        .try_into()
+        .map_err(|_| Error::Narinfo(format!("hash is not sha256: {s:?}")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +228,7 @@ impl NixCache {
     }
 
     /// Opens a decompressed NAR stream for the given cache hit.
-    pub async fn nar_stream(&self, nar: &CachedNar) -> Result<Box<dyn AsyncRead + Unpin>> {
+    pub async fn nar_stream(&self, nar: &CachedNar) -> Result<Box<dyn AsyncRead + Unpin + Send>> {
         let url = self
             .base
             .join(&nar.url)
@@ -272,6 +295,7 @@ fn parse_narinfo(text: &str) -> Result<CachedNar> {
         url: info.url.to_string(),
         compression: Compression::from_narinfo(info.compression.as_deref(), info.url),
         nar_size: info.nar_size as u64,
+        nar_hash: parse_sha256(&info.nar_hash)?,
         references: info
             .references
             .iter()

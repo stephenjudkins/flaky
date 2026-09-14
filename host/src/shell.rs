@@ -43,7 +43,8 @@ pub async fn run(
     }
 
     let dir = synth_flake(&cache_dir)?;
-    let evaluated = flake::eval(&dir, &attrs, &cache_dir).await?;
+    let orch = crate::orchestrator::Orchestrator::new(&cache_url, cache_dir.clone())?;
+    let evaluated = flake::eval(&orch, &dir, &attrs).await?;
 
     let mut out_paths: BTreeMap<String, String> = BTreeMap::new();
     let mut closure_paths = std::collections::BTreeSet::new();

@@ -30,6 +30,27 @@ pub fn nix_base32_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Inverse of [`nix_base32_encode`]: the byte length is implied by the
+/// string length (52 chars <-> 32 bytes, 32 chars <-> 20 bytes).
+pub fn nix_base32_decode(s: &str) -> Option<Vec<u8>> {
+    let n = 5 * s.len() / 8;
+    if n == 0 || (n * 8 - 1) / 5 + 1 != s.len() {
+        return None;
+    }
+    let num_chars = s.len();
+    let mut out = vec![0u8; n];
+    for (p, c) in s.bytes().enumerate() {
+        let v = NIX_BASE32.as_bytes().iter().position(|&x| x == c)? as u16;
+        let j = (num_chars - 1 - p) * 5;
+        let (k, r) = (j / 8, j % 8);
+        out[k] |= ((v << r) & 0xff) as u8;
+        if r > 3 && k + 1 < n {
+            out[k + 1] |= (v >> (8 - r)) as u8;
+        }
+    }
+    Some(out)
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {

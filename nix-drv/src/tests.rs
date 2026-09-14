@@ -101,6 +101,39 @@ fn nix_base32_matches_nix() {
     );
 }
 
+#[test]
+fn nix_base32_decode_inverts_encode() {
+    for bytes in [
+        vec![0u8; 32],
+        vec![0xff; 32],
+        hex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"),
+        hex("641cf30961525cbe3b340cc883436c8854e9f5032f459f444de4782b621e6572"),
+    ] {
+        let s = nix_base32_encode(&bytes);
+        assert_eq!(nix_base32_decode(&s).as_deref(), Some(&bytes[..]));
+    }
+}
+
+#[test]
+fn nix_base32_decode_matches_nix() {
+    // generated with `nix hash to-base32 --type sha256 <hex>`
+    assert_eq!(
+        nix_base32_decode("0wk53ri2ny749m29yi9g0gsyjm48di1q7j0c6hxvwp2jc44z6734").as_deref(),
+        Some(&hex("641cf30961525cbe3b340cc883436c8854e9f5032f459f444de4782b621e6572")[..])
+    );
+    assert_eq!(
+        nix_base32_decode("1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").as_deref(),
+        Some(&[0xff; 32][..])
+    );
+    assert!(nix_base32_decode("0").is_none());
+    assert!(nix_base32_decode("e").is_none()); // not in alphabet
+    assert!(nix_base32_decode(&"0".repeat(51)).is_none());
+    assert_eq!(
+        nix_base32_decode(&"0".repeat(52)).as_deref(),
+        Some(&[0u8; 32][..])
+    );
+}
+
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)

@@ -4,6 +4,7 @@ resolver = "3"
 
 [patch.crates-io]
 alioth = { path = "../alioth/alioth" }
+erofs-builder = { path = "../erofs-rs" }
 
 [workspace.package]
 version = "0.1.0"

@@ -5,8 +5,10 @@ edition.workspace = true
 
 [dependencies]
 async-compression.workspace = true
+base64.workspace = true
 erofs-builder.workspace = true
 futures.workspace = true
+nix-drv.workspace = true
 nar-to-erofs.workspace = true
 narinfo.workspace = true
 reqwest.workspace = true

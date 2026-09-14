@@ -805,8 +805,6 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "erofs-builder"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3e8950a49f10abbf022e953bd03bbb63ac53efc27dc91f6b1d50f8217e36b8"
 dependencies = [
  "crc32c",
  "rand 0.8.8",
@@ -1596,10 +1594,12 @@ name = "nix-cache"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "base64",
  "erofs-builder",
  "futures",
  "nar-to-erofs",
  "narinfo",
+ "nix-drv",
  "reqwest",
  "sha2",
  "tempfile",

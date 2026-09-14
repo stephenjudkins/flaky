@@ -12,28 +12,21 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-use anyhow::{Context as _, anyhow};
-use nix_cache::{Lookup, NixCache, StorePathHash};
+use anyhow::anyhow;
+use nix_cache::{Lookup, StorePathHash};
 use nix_drv::{Closure, Derivations};
 
-use super::{Ctx, Plan, image_path, producing_drv};
-use crate::orchestrator::BuildOpts;
+use super::{Plan, Workspace, producing_drv};
+use crate::task::Context;
 
 pub(super) async fn plan<'a>(
+    ctx: &Context,
     drvs: &'a Derivations,
     closure: &'a Closure,
     root: &'a str,
-    opts: &'a BuildOpts,
+    extra_images: &BTreeMap<String, PathBuf>,
     expand_roots: bool,
-) -> anyhow::Result<Ctx<'a>> {
-    let cache = NixCache::new(&opts.cache_url)
-        .context("creating cache client")?
-        .with_disk_cache(opts.cache_dir.join("narinfo"));
-
-    for d in ["erofs", "build", "tmp"] {
-        std::fs::create_dir_all(opts.cache_dir.join(d))?;
-    }
-
+) -> anyhow::Result<Workspace<'a>> {
     // fast path: when every output of the root drv already has a local
     // image, the build goal is already realized — no lookups or VM builds
     // can be needed (delete an output image in .cache/erofs to force a
@@ -43,19 +36,17 @@ pub(super) async fn plan<'a>(
         && drvs[root]
             .outputs
             .values()
-            .all(|o| image_path(opts, &o.path).exists())
+            .all(|o| ctx.image_path(&o.path).exists())
     {
         let images = drvs[root]
             .outputs
             .values()
-            .map(|o| (o.path.clone(), image_path(opts, &o.path)))
+            .map(|o| (o.path.clone(), ctx.image_path(&o.path)))
             .collect();
         println!("build: root outputs already cached locally");
-        return Ok(Ctx {
+        return Ok(Workspace {
             drvs,
             closure,
-            opts,
-            cache,
             plan: Plan {
                 hits: BTreeMap::new(),
                 fetches: BTreeMap::new(),
@@ -72,27 +63,25 @@ pub(super) async fn plan<'a>(
     let mut images: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut hits = BTreeMap::new();
     for p in &closure.store_paths {
-        let img = image_path(opts, p);
+        let img = ctx.image_path(p);
         if !img.exists() {
             continue;
         }
         images.insert(p.clone(), img);
         if let Ok(hash) = StorePathHash::from_store_path(p) {
-            if let Ok(Some(Lookup::Hit(nar))) = cache.lookup_local(&hash) {
+            if let Ok(Some(Lookup::Hit(nar))) = ctx.nix_cache().lookup_local(&hash) {
                 hits.insert(p.clone(), nar);
             }
         }
     }
     println!("build: {} images cached from earlier runs", images.len());
-    for (p, img) in &opts.extra_images {
+    for (p, img) in extra_images {
         images.entry(p.clone()).or_insert_with(|| img.clone());
     }
 
-    let mut ctx = Ctx {
+    let mut ws = Workspace {
         drvs,
         closure,
-        opts,
-        cache,
         plan: Plan {
             hits,
             fetches: BTreeMap::new(),
@@ -101,20 +90,25 @@ pub(super) async fn plan<'a>(
         },
         images,
     };
-    resolve(&mut ctx, root, expand_roots).await?;
-    Ok(ctx)
+    resolve(&mut ws, ctx, root, expand_roots).await?;
+    Ok(ws)
 }
 
-async fn resolve(ctx: &mut Ctx<'_>, root: &str, expand_roots: bool) -> anyhow::Result<()> {
+async fn resolve(
+    ws: &mut Workspace<'_>,
+    ctx: &Context,
+    root: &str,
+    expand_roots: bool,
+) -> anyhow::Result<()> {
     let mut to_build: BTreeSet<String> = BTreeSet::new();
     // (store path, expand references?) — expansion applies to inputs of
     // builds and, for closure goals, to the root output itself; otherwise
     // the root outputs are the goal, not build inputs
     let mut frontier: VecDeque<(String, bool)> = match expand_roots {
-        true => super::primary_output(ctx.drvs, root)
+        true => super::primary_output(ws.drvs, root)
             .map(|p| VecDeque::from([(p, true)]))
             .unwrap_or_default(),
-        false => ctx.drvs[root]
+        false => ws.drvs[root]
             .outputs
             .values()
             .map(|o| (o.path.clone(), false))
@@ -126,31 +120,31 @@ async fn resolve(ctx: &mut Ctx<'_>, root: &str, expand_roots: bool) -> anyhow::R
         if !done.insert(p.clone()) {
             continue;
         }
-        if ctx.images.contains_key(&p)
-            || ctx.plan.fetches.contains_key(&p)
-            || ctx.plan.fetchurl.contains_key(&p)
+        if ws.images.contains_key(&p)
+            || ws.plan.fetches.contains_key(&p)
+            || ws.plan.fetchurl.contains_key(&p)
         {
             // already materialized (or queued); fall through to expansion
         } else {
             let hash = StorePathHash::from_store_path(&p)?;
-            match ctx.cache.lookup(&hash).await {
+            match ctx.nix_cache().lookup(&hash).await {
                 Ok(Lookup::Hit(nar)) => {
                     println!("[hit] {}", nix_drv::basename(&p));
-                    ctx.plan.hits.insert(p.clone(), nar.clone());
-                    ctx.plan.fetches.insert(p.clone(), nar);
+                    ws.plan.hits.insert(p.clone(), nar.clone());
+                    ws.plan.fetches.insert(p.clone(), nar);
                 }
                 Ok(Lookup::Miss) => {
-                    let dp = producing_drv(ctx.closure, ctx.drvs, &p)
+                    let dp = producing_drv(ws.closure, ws.drvs, &p)
                         .ok_or_else(|| anyhow!("no drv in closure produces {p}"))?;
-                    if ctx.drvs[&dp].builder == "builtin:fetchurl" {
+                    if ws.drvs[&dp].builder == "builtin:fetchurl" {
                         println!(
                             "[miss] {}: builtin:fetchurl, will realize on demand",
                             nix_drv::basename(&p)
                         );
-                        ctx.plan.fetchurl.insert(p.clone(), dp.clone());
+                        ws.plan.fetchurl.insert(p.clone(), dp.clone());
                     } else if to_build.insert(dp.clone()) {
                         println!("[miss] {}: will build {}", nix_drv::basename(&p), dp);
-                        for inp in ctx.drv_direct_inputs(&dp) {
+                        for inp in ws.drv_direct_inputs(&dp) {
                             frontier.push_back((inp, true));
                         }
                     }
@@ -162,7 +156,7 @@ async fn resolve(ctx: &mut Ctx<'_>, root: &str, expand_roots: bool) -> anyhow::R
             }
         }
         if expand {
-            for r in ctx.refs_of(&p) {
+            for r in ws.refs_of(&p) {
                 frontier.push_back((r, true));
             }
         }
@@ -170,11 +164,11 @@ async fn resolve(ctx: &mut Ctx<'_>, root: &str, expand_roots: bool) -> anyhow::R
 
     println!(
         "build: {} to fetch, {} fetchurl, {} to build",
-        ctx.plan.fetches.len(),
-        ctx.plan.fetchurl.len(),
+        ws.plan.fetches.len(),
+        ws.plan.fetchurl.len(),
         to_build.len()
     );
-    ctx.plan.to_build = topo_order(ctx.drvs, &to_build, root);
+    ws.plan.to_build = topo_order(ws.drvs, &to_build, root);
     Ok(())
 }
 

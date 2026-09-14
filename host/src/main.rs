@@ -12,6 +12,8 @@ mod orchestrator;
 mod rpc;
 mod shell;
 mod tarball;
+mod task;
+mod tasks;
 mod vm;
 mod vsock_device;
 mod vsock_pipe;
