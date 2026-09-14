@@ -64,6 +64,55 @@ Sig: cache.nixos.org-1:fake
 }
 
 #[test]
+fn verify_produced_checks_size_then_hash() {
+    let n = std::sync::atomic::AtomicU64::new(3);
+    let mut h = Sha256::new();
+    h.update(b"abc");
+    let digest: [u8; 32] = h.clone().finalize().into();
+    let h = std::sync::Mutex::new(h);
+    let nar = |nar_size: u64, nar_hash: [u8; 32]| CachedNar {
+        url: "nar/x.nar".to_string(),
+        compression: Compression::None,
+        nar_size,
+        nar_hash,
+        references: Vec::new(),
+    };
+    assert!(matches!(
+        verify_produced(&n, &h, &nar(4, digest)),
+        Err(Error::Narinfo(_))
+    ));
+    assert!(matches!(
+        verify_produced(&n, &h, &nar(3, [0u8; 32])),
+        Err(Error::HashMismatch { .. })
+    ));
+    assert!(verify_produced(&n, &h, &nar(3, digest)).is_ok());
+}
+
+#[tokio::test]
+async fn counting_reader_counts_and_hashes() {
+    use tokio::io::AsyncReadExt as _;
+    let data = b"the quick brown fox";
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hash = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
+    let mut reader = CountingReader {
+        inner: &data[..],
+        n: n.clone(),
+        hash: hash.clone(),
+    };
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).await.unwrap();
+    assert_eq!(out, data);
+    assert_eq!(
+        n.load(std::sync::atomic::Ordering::SeqCst),
+        data.len() as u64
+    );
+    assert_eq!(
+        hash.lock().unwrap().clone().finalize()[..],
+        Sha256::digest(data)[..]
+    );
+}
+
+#[test]
 fn legacy_miss_markers_are_removed() {
     let (cache, _dir) = disk_cache();
     let hash = StorePathHash::new("846h582z2d4mifn4km7axlqllcyn6zdg").unwrap();

@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use nar_to_erofs::NarDecoder;
 use narinfo::NarInfo;
 use reqwest::IntoUrl;
+use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -94,7 +95,7 @@ pub struct CachedNar {
     pub compression: Compression,
     /// Size of the decompressed NAR in bytes.
     pub nar_size: u64,
-    /// sha256 of the decompressed NAR, for verifying fetched images.
+    /// sha256 of the decompressed NAR, verified inline while streaming.
     pub nar_hash: [u8; 32],
     /// Store path names (hash-name, no /nix/store/ prefix) this path
     /// references, from the narinfo `References:` line.
@@ -305,8 +306,9 @@ fn parse_narinfo(text: &str) -> Result<CachedNar> {
     })
 }
 
-/// Streams a NAR from the cache into an EROFS image on `sink`, verifying
-/// `nar.nar_size` bytes were consumed. All entries are placed under `prefix`.
+/// Streams a NAR from the cache into a fresh EROFS image on `sink`,
+/// verifying the narinfo's `NarSize` and `NarHash` inline as the stream is
+/// consumed. All entries are placed under `prefix`.
 pub async fn fetch_nar_to_erofs<W>(
     cache: &NixCache,
     nar: &CachedNar,
@@ -318,24 +320,20 @@ where
 {
     let stream = cache.nar_stream(nar).await?;
     let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hash = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
     let counting = CountingReader {
         inner: stream,
         n: n.clone(),
+        hash: hash.clone(),
     };
     let sink = nar_to_erofs::nar_to_image(counting, sink, prefix).await?;
-    let produced = n.load(std::sync::atomic::Ordering::SeqCst);
-    if produced != nar.nar_size {
-        return Err(Error::Narinfo(format!(
-            "nar size mismatch: narinfo says {}, stream produced {}",
-            nar.nar_size, produced
-        )));
-    }
+    verify_produced(&n, &hash, nar)?;
     Ok(sink)
 }
 
 /// Streams a NAR from the cache into an existing EROFS `Writer` (e.g. a
 /// merged store image), placing all entries under `prefix` and verifying
-/// `nar.nar_size` bytes were consumed.
+/// the narinfo's `NarSize` and `NarHash` inline as the stream is consumed.
 pub async fn fetch_nar_into<W>(
     cache: &NixCache,
     nar: &CachedNar,
@@ -347,12 +345,23 @@ where
 {
     let stream = cache.nar_stream(nar).await?;
     let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hash = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
     let counting = CountingReader {
         inner: stream,
         n: n.clone(),
+        hash: hash.clone(),
     };
     let mut decoder = NarDecoder::new(counting);
     nar_to_erofs::write_nar(&mut decoder, writer, Some(prefix)).await?;
+    verify_produced(&n, &hash, nar)?;
+    Ok(())
+}
+
+fn verify_produced(
+    n: &std::sync::atomic::AtomicU64,
+    hash: &std::sync::Mutex<Sha256>,
+    nar: &CachedNar,
+) -> Result<()> {
     let produced = n.load(std::sync::atomic::Ordering::SeqCst);
     if produced != nar.nar_size {
         return Err(Error::Narinfo(format!(
@@ -360,12 +369,20 @@ where
             nar.nar_size, produced
         )));
     }
+    let digest: [u8; 32] = hash.lock().unwrap().clone().finalize().into();
+    if digest != nar.nar_hash {
+        return Err(Error::HashMismatch {
+            expected: nix_drv::nix_base32_encode(&nar.nar_hash),
+            actual: nix_drv::nix_base32_encode(&digest),
+        });
+    }
     Ok(())
 }
 
 struct CountingReader<R> {
     inner: R,
     n: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    hash: std::sync::Arc<std::sync::Mutex<Sha256>>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
@@ -378,10 +395,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
         let filled_before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                this.n.fetch_add(
-                    (buf.filled().len() - filled_before) as u64,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
+                let filled = buf.filled();
+                let delta = filled.len() - filled_before;
+                this.n
+                    .fetch_add(delta as u64, std::sync::atomic::Ordering::SeqCst);
+                this.hash.lock().unwrap().update(&filled[filled_before..]);
                 Poll::Ready(Ok(()))
             }
             other => other,
